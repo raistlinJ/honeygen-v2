@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>MainWindow</class>
+ <widget class="QMainWindow" name="MainWindow">
+  <widget class="QWidget" name="centralwidget">
+   <layout class="QVBoxLayout" name="verticalLayout">
+    <widget class="QPushButton" name="runButton">
+     <property name="text">
+      <string>Run Binary</string>
+     </property>
+    </widget>
+    <widget class="QTextEdit" name="logOutput">
+     <property name="readOnly">
+      <bool>true</bool>
+     </property>
+    </widget>
+   </layout>
+  </widget>
+  <menuBar class="QMenuBar" name="menubar">
+   <menu class="QMenu" name="menuFile">
+    <action name="actionExit">
+     <property name="text">
+      <string>Exit</string>
+     </property>
+    </action>
+   </menu>
+  </menuBar>
+  <statusBar class="QStatusBar" name="statusbar"/>
+ </widget>
+ <resources/>
+ <connections/>
+</ui>

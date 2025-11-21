@@ -1,0 +1,47 @@
+{
+  "Default Project": [
+    {
+      "entry_id": "e1ed99a3-e536-4ed2-8c45-de7e755898ed",
+      "name": "nmap",
+      "binary_path": "/bin/ls",
+      "log_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/pin_logs/instruction_log.txt",
+      "timestamp": "2025-11-20T09:13:35.085064"
+    },
+    {
+      "entry_id": "3be9e700-28ff-4d2a-a356-f3f2924d83a6",
+      "name": "run2",
+      "binary_path": "/bin/ls",
+      "log_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/Default_Project/instruction_log.txt",
+      "timestamp": "2025-11-20T09:48:59.656853"
+    },
+    {
+      "entry_id": "d6b74104-0758-4613-9c60-8294a1f744f2",
+      "name": "run3",
+      "binary_path": "/bin/ls",
+      "log_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/Default_Project/instruction_log_run3.txt",
+      "timestamp": "2025-11-20T10:15:21.201130"
+    }
+  ],
+  "ls_honeypot": [
+    {
+      "entry_id": "a366a8de-01a2-4096-9c90-482ccc7d8613",
+      "name": "run1",
+      "binary_path": "/bin/ls",
+      "log_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/ls_honeypot/instruction_log_run1.txt",
+      "timestamp": "2025-11-20T22:20:58.836869",
+      "sanitized_binary_path": null,
+      "parent_entry_id": null,
+      "is_sanitized_run": false
+    },
+    {
+      "entry_id": "84376b64-2316-4f90-8c18-07982f77ee90",
+      "name": "ls @ 2025-11-20 22:26:51",
+      "binary_path": "/bin/ls",
+      "log_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/ls_honeypot/instruction_log_ls_2025-11-20_22_26_51.txt",
+      "timestamp": "2025-11-20T22:27:09.552999",
+      "sanitized_binary_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/ls_honeypot/ls_2025-11-20_22_26_51/sanitized/ls",
+      "parent_entry_id": null,
+      "is_sanitized_run": false
+    }
+  ]
+}

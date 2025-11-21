@@ -1,0 +1,5 @@
+PySide2
+intel-pin
+pytest
+capstone>=5.0.0
+lief>=0.14.0

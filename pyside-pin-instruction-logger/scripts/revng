@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+TTY_FLAGS=-i
+if [ -t 0 ] && [ -t 1 ]; then
+  TTY_FLAGS=-it
+fi
+docker run --rm $TTY_FLAGS \
+  -v "$PWD":"$PWD" \
+  -w "$PWD" \
+  revng/revng revng "$@"

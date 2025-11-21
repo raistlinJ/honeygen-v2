@@ -1,0 +1,7 @@
+# Minimal build rules for the custom PIN tool.
+
+TOOL_ROOTS := ins_logger
+TEST_TOOL_ROOTS :=
+TEST_ROOTS :=
+RUNNABLE_TESTS :=
+SANITY_SUBSET :=
