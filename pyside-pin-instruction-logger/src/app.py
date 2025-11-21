@@ -671,6 +671,8 @@ class App(QMainWindow):
         self.logs_exec_label = QLabel("Execution Logs for: None", logs_tab)
         self.logs_list = QListWidget(logs_tab)
         self.logs_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.logs_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.logs_list.customContextMenuRequested.connect(self._show_logs_list_context_menu)
         self.create_log_button = QPushButton("Execute Binary", logs_tab)
         self.delete_log_button = QPushButton("Delete Selected Log", logs_tab)
         self.log_preview_label = QLabel("Instruction Trace", logs_tab)
@@ -679,6 +681,8 @@ class App(QMainWindow):
         self.log_preview.setSelectionBehavior(QAbstractItemView.SelectColumns)
         self.log_preview.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.log_preview.verticalHeader().setVisible(False)
+        self.log_preview.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.log_preview.customContextMenuRequested.connect(self._show_log_table_context_menu)
         header = self.log_preview.horizontalHeader()
         header.setStretchLastSection(True)
         header.setSectionsClickable(True)
@@ -2067,6 +2071,33 @@ class App(QMainWindow):
             return None
         return next((entry for entry in self.run_entries if entry.entry_id == entry_id), None)
 
+    def _current_log_entry(self) -> RunEntry | None:
+        if not hasattr(self, "logs_list"):
+            return None
+        return self._entry_from_item(self.logs_list.currentItem())
+
+    def _open_log_directory(self, entry: RunEntry | None = None) -> None:
+        candidate = entry or self._current_log_entry()
+        if not candidate or not candidate.log_path:
+            QMessageBox.information(self, "Log unavailable", "Select a log entry with a saved log path.")
+            return
+        path = Path(candidate.log_path)
+        if path.exists():
+            target = path if path.is_dir() else path.parent
+        else:
+            target = path.parent
+            if not target.exists():
+                QMessageBox.warning(
+                    self,
+                    "Log missing",
+                    f"Expected log at {path}, but it and its parent directory are missing.",
+                )
+                return
+            self._append_console(f"Log file missing, opening parent directory instead: {target}")
+        opened = QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
+        if not opened:
+            QMessageBox.warning(self, "Unable to open", "The operating system rejected the request to open the log directory.")
+
     def _has_active_sanitization(self) -> bool:
         thread = self._current_sanitize_thread
         return thread is not None and thread.isRunning()
@@ -2478,6 +2509,31 @@ class App(QMainWindow):
         if label is None:
             return
         label.setText(self._honey_entries_heading())
+
+    def _show_logs_list_context_menu(self, position) -> None:
+        if not hasattr(self, "logs_list"):
+            return
+        item = self.logs_list.itemAt(position)
+        if item is not None:
+            self.logs_list.setCurrentItem(item)
+        entry = self._entry_from_item(item or self.logs_list.currentItem())
+        menu = QMenu(self)
+        open_dir_action = menu.addAction("Open dir with complete log")
+        open_dir_action.setEnabled(entry is not None and bool(entry and entry.log_path))
+        action = menu.exec(self.logs_list.viewport().mapToGlobal(position))
+        if action == open_dir_action:
+            self._open_log_directory(entry)
+
+    def _show_log_table_context_menu(self, position) -> None:
+        if not hasattr(self, "log_preview"):
+            return
+        entry = self._current_log_entry()
+        menu = QMenu(self)
+        open_dir_action = menu.addAction("Open dir with complete log")
+        open_dir_action.setEnabled(entry is not None and bool(entry and entry.log_path))
+        action = menu.exec(self.log_preview.viewport().mapToGlobal(position))
+        if action == open_dir_action:
+            self._open_log_directory(entry)
 
     def _handle_logs_selection_change(self, current: QListWidgetItem | None, previous: QListWidgetItem | None) -> None:
         self.update_log_detail_from_selection(current, previous)
