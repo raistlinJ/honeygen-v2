@@ -2,20 +2,43 @@
 #include <fstream>
 #include <vector>
 #include <memory>
+#include <sstream>
+#include <iomanip>
 #include "pin.H"
 
 std::ofstream logFile;
 std::vector<std::unique_ptr<std::string>> g_disassembly_cache;
 PIN_LOCK g_log_lock;
 
+static BOOL FollowChild(CHILD_PROCESS childProcess, VOID * /* val */) {
+    // Always follow forked children to keep logging coverage intact.
+    return TRUE;
+}
+
+static BOOL IsApplicationInstruction(INS ins) {
+    SEC section = INS_Sec(ins);
+    if (!SEC_Valid(section)) {
+        return FALSE;
+    }
+    IMG image = SEC_Img(section);
+    if (!IMG_Valid(image)) {
+        return FALSE;
+    }
+    return IMG_IsMainExecutable(image);
+}
+
 VOID recordInstruction(THREADID tid, ADDRINT address, const std::string *disassembly) {
     PIN_GetLock(&g_log_lock, tid + 1);
-    logFile << "Executed instruction at: " << std::hex << address
-            << " - " << *disassembly << std::endl;
+    logFile << "Executed instruction at: 0x" << std::hex << address
+            << " [pid=" << PIN_GetPid() << " tid=" << tid << "] - "
+            << *disassembly << std::endl;
     PIN_ReleaseLock(&g_log_lock);
 }
 
 VOID instruction(INS ins, VOID *v) {
+    if (!IsApplicationInstruction(ins)) {
+        return;
+    }
     auto dis_holder = std::make_unique<std::string>(INS_Disassemble(ins));
     std::string *dis = dis_holder.get();
     g_disassembly_cache.emplace_back(std::move(dis_holder));
@@ -39,7 +62,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    logFile.open("instruction_log.txt");
+    logFile.open("instruction_log.txt", std::ios::out | std::ios::app);
     if (!logFile.is_open()) {
         std::cerr << "Error opening log file!" << std::endl;
         return 1;
@@ -48,6 +71,7 @@ int main(int argc, char *argv[]) {
     PIN_InitLock(&g_log_lock);
     PIN_Init(argc, argv);
     INS_AddInstrumentFunction(instruction, 0);
+    PIN_AddFollowChildProcessFunction(FollowChild, nullptr);
     PIN_AddFiniFunction(Fini, 0);
     PIN_StartProgram();
     return 0;

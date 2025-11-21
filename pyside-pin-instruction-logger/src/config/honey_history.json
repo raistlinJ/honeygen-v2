@@ -42,6 +42,16 @@
       "sanitized_binary_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/ls_honeypot/ls_2025-11-20_22_26_51/sanitized/ls",
       "parent_entry_id": null,
       "is_sanitized_run": false
+    },
+    {
+      "entry_id": "1375d1a4-8123-4de3-a9ab-41c25ddbc909",
+      "name": "nolib",
+      "binary_path": "/bin/ls",
+      "log_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/ls_honeypot/instruction_log_nolib.txt",
+      "timestamp": "2025-11-21T00:15:07.534638",
+      "sanitized_binary_path": null,
+      "parent_entry_id": null,
+      "is_sanitized_run": false
     }
   ]
 }

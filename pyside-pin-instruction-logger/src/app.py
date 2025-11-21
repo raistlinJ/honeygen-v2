@@ -7,9 +7,12 @@ import sys
 import uuid
 import subprocess
 import difflib
+import stat
 from datetime import datetime
 from pathlib import Path
-from typing import Callable
+from typing import Callable, NamedTuple
+
+import lief
 
 from PySide6.QtCore import Qt, QObject, QThread, Signal, QUrl
 from PySide6.QtWidgets import (
@@ -48,7 +51,7 @@ from controllers.runner import RunnerController
 from config_manager import AppConfig, ConfigManager, DEFAULT_LOG_PATH
 from models.run_entry import RunEntry
 from services.history_store import HistoryStore
-from services.log_analyzer import collect_executed_addresses, ExecutedAddressReport
+from services.log_analyzer import collect_executed_addresses
 from services.binary_sanitizer import BinarySanitizer, SanitizationResult
 
 
@@ -183,19 +186,32 @@ class SanitizeWorker(QObject):
     succeeded = Signal(SanitizationResult)
     failed = Signal(str)
 
-    def __init__(self, entry_id: str, binary_path: Path, log_path: Path, output_path: Path) -> None:
+    def __init__(
+        self,
+        entry_id: str,
+        binary_path: Path,
+        log_path: Path,
+        output_path: Path,
+        options: "SanitizeOptions",
+        *,
+        executed_addresses: set[int],
+        parsed_rows: int,
+        instruction_samples: list[tuple[int, str]],
+    ) -> None:
         super().__init__()
         self.entry_id = entry_id
         self.binary_path = binary_path
         self.log_path = log_path
         self.output_path = output_path
+        self.options = options
+        self.executed_addresses = set(executed_addresses)
+        self.parsed_rows = parsed_rows
+        self.instruction_samples = instruction_samples
 
     def run(self) -> None:
         try:
-            self.progress.emit(f"Opening instruction log at: {self.log_path}")
-            report: ExecutedAddressReport = collect_executed_addresses(self.log_path)
-            executed = report.addresses
-            parsed_rows = report.parsed_rows
+            executed = set(self.executed_addresses)
+            parsed_rows = self.parsed_rows
             self.progress.emit(
                 f"Parsed {parsed_rows} instruction rows; {len(executed)} unique addresses will be preserved."
             )
@@ -207,12 +223,33 @@ class SanitizeWorker(QObject):
                     )
                 )
                 return
-            self.progress.emit("Running sanitizer...")
             sanitizer = BinarySanitizer()
-            result = sanitizer.sanitize(self.binary_path, executed, self.output_path)
+            binary_obj = None
+            if self.options.sanity_check and self.instruction_samples:
+                self.progress.emit("Validating logged instructions against binary...")
+                binary_obj = lief.parse(str(self.binary_path))
+                sanitizer.verify_logged_instructions(binary_obj, self.instruction_samples)
+            self.progress.emit("Running sanitizer...")
+            result = sanitizer.sanitize(
+                self.binary_path,
+                executed,
+                self.output_path,
+                forced_mode=self.options.permissions_mask,
+                binary=binary_obj,
+            )
+            if self.options.sanity_check:
+                self.progress.emit("Running sanity check on sanitized binary...")
+                sanitizer.sanity_check(result.output_path)
+                self.progress.emit("Sanity check passed.")
             self.succeeded.emit(result)
         except Exception as exc:  # pragma: no cover - GUI background task
             self.failed.emit(f"Sanitization failed for log '{self.log_path}': {exc}")
+
+
+class SanitizeOptions(NamedTuple):
+    sanity_check: bool
+    output_name: str | None
+    permissions_mask: int | None
 
 
 class BuildProgressDialog(QDialog):
@@ -299,6 +336,78 @@ class SanitizeProgressDialog(QDialog):
             event.ignore()
             return
         super().closeEvent(event)
+
+
+class SanitizeConfigDialog(QDialog):
+    def __init__(
+        self,
+        parent: QWidget,
+        *,
+        default_name: str,
+        default_permissions: int,
+        sanity_allowed: bool,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Sanitize Options")
+        self.setModal(True)
+        layout = QVBoxLayout(self)
+
+        self.sanity_checkbox = QCheckBox("Sanity check", self)
+        self.sanity_checkbox.setEnabled(sanity_allowed)
+        if not sanity_allowed:
+            self.sanity_checkbox.setChecked(False)
+            self.sanity_checkbox.setToolTip("Sanity check unavailable: no executed instructions detected.")
+        layout.addWidget(self.sanity_checkbox)
+
+        filename_row = QHBoxLayout()
+        filename_row.addWidget(QLabel("Output filename:", self))
+        self.filename_input = QLineEdit(default_name, self)
+        filename_row.addWidget(self.filename_input)
+        layout.addLayout(filename_row)
+
+        permissions_label = QLabel("Permissions:", self)
+        layout.addWidget(permissions_label)
+        permissions_row = QHBoxLayout()
+        self.read_checkbox = QCheckBox("Read (r)", self)
+        self.write_checkbox = QCheckBox("Write (w)", self)
+        self.exec_checkbox = QCheckBox("Execute (x)", self)
+        permissions_row.addWidget(self.read_checkbox)
+        permissions_row.addWidget(self.write_checkbox)
+        permissions_row.addWidget(self.exec_checkbox)
+        permissions_row.addStretch(1)
+        layout.addLayout(permissions_row)
+
+        self._apply_default_permissions(default_permissions)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Cancel | QDialogButtonBox.Ok, self)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _apply_default_permissions(self, mode: int) -> None:
+        self.read_checkbox.setChecked(bool(mode & stat.S_IRUSR))
+        self.write_checkbox.setChecked(bool(mode & stat.S_IWUSR))
+        self.exec_checkbox.setChecked(bool(mode & stat.S_IXUSR))
+
+    def selected_options(self) -> SanitizeOptions:
+        name = self.filename_input.text().strip()
+        safe_name = Path(name).name if name else None
+        permissions = self._build_permissions_mask()
+        return SanitizeOptions(
+            sanity_check=self.sanity_checkbox.isChecked(),
+            output_name=safe_name,
+            permissions_mask=permissions,
+        )
+
+    def _build_permissions_mask(self) -> int:
+        mask = 0
+        if self.read_checkbox.isChecked():
+            mask |= stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH
+        if self.write_checkbox.isChecked():
+            mask |= stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH
+        if self.exec_checkbox.isChecked():
+            mask |= stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
+        return mask
 
 
 class DiffDialog(QDialog):
@@ -559,7 +668,7 @@ class App(QMainWindow):
         # Logs tab
         logs_tab = QWidget()
         logs_layout = QVBoxLayout(logs_tab)
-        self.logs_exec_label = QLabel("Executable: None", logs_tab)
+        self.logs_exec_label = QLabel("Execution Logs for: None", logs_tab)
         self.logs_list = QListWidget(logs_tab)
         self.logs_list.setSelectionMode(QAbstractItemView.SingleSelection)
         self.create_log_button = QPushButton("Execute Binary", logs_tab)
@@ -626,7 +735,7 @@ class App(QMainWindow):
         # HoneyProc tab
         honey_tab = QWidget()
         honey_layout = QVBoxLayout(honey_tab)
-        entries_label = QLabel("HoneyProc Entries", honey_tab)
+        self.honey_entries_label = QLabel("", honey_tab)
         self.honey_list = QListWidget(honey_tab)
         self.honey_list.setSelectionMode(QAbstractItemView.SingleSelection)
         honey_buttons = QHBoxLayout()
@@ -651,15 +760,15 @@ class App(QMainWindow):
         honey_buttons.addWidget(self.honey_reveal_button)
         honey_buttons.addWidget(self.honey_compare_button)
 
-        honey_layout.addWidget(entries_label)
+        honey_layout.addWidget(self.honey_entries_label)
         honey_layout.addWidget(self.honey_list)
         honey_layout.addLayout(honey_buttons)
         self.honey_sanitized_status = QLabel("Sanitized binary: Not generated.", honey_tab)
         self.honey_sanitized_status.setWordWrap(True)
         self.honey_parent_status = QLabel("Parent linkage: N/A", honey_tab)
         self.honey_parent_status.setWordWrap(True)
-        honey_layout.addWidget(self.honey_sanitized_status)
-        honey_layout.addWidget(self.honey_parent_status)
+        self.honey_sanitized_status.hide()
+        self.honey_parent_status.hide()
         honey_layout.addStretch()
 
         self.tabs.addTab(config_tab, "Configuration")
@@ -693,6 +802,7 @@ class App(QMainWindow):
         self._refresh_revng_status()
         self._refresh_revng_container_status()
         self._update_log_preview(None)
+        self._update_honey_entries_label()
 
     def _log_template_path(self) -> Path:
         raw = (self.config.log_path or "").strip()
@@ -1531,8 +1641,9 @@ class App(QMainWindow):
         self.binary_path.setText(path)
         self.config.binary_path = path
         self.config_manager.save(self.config)
-        self.logs_exec_label.setText(f"Executable: {Path(path).name}")
+        self.logs_exec_label.setText(f"Execution Logs for: {Path(path).name}")
         self._append_console(f"Selected binary: {path}")
+        self._update_honey_entries_label()
 
     def select_tool(self) -> None:
         current_tool = self.tool_path.text().strip() or str(self._default_tool_path_value)
@@ -1586,11 +1697,56 @@ class App(QMainWindow):
             )
             return
 
-        output_path = self._sanitized_output_path(entry)
+        default_output_path = self._sanitized_output_path(entry)
+        report = None
+        analyze_dialog = self._show_busy_dialog("Analyzing instruction log...", title="Preparing Sanitization")
+        try:
+            try:
+                report = collect_executed_addresses(log_path)
+            except Exception as exc:
+                QMessageBox.critical(
+                    self,
+                    "Unable to analyze log",
+                    f"Failed to parse instruction log before sanitization:\n{exc}",
+                )
+                self._append_console(f"Sanitization aborted: {exc}")
+                return
+        finally:
+            analyze_dialog.close()
+        if not report or not report.addresses:
+            QMessageBox.warning(
+                self,
+                "No instructions",
+                "The selected log does not contain any executed instruction entries.",
+            )
+            return
+        sanity_allowed = bool(report.sampled_instructions)
+        config_dialog = SanitizeConfigDialog(
+            self,
+            default_name=default_output_path.name,
+            default_permissions=binary_path.stat().st_mode,
+            sanity_allowed=sanity_allowed,
+        )
+        if config_dialog.exec() != QDialog.Accepted:
+            self._append_console("Sanitization cancelled before launch.")
+            return
+        sanitize_options = config_dialog.selected_options()
+        output_path = default_output_path
+        if sanitize_options.output_name:
+            output_path = default_output_path.with_name(sanitize_options.output_name)
         self._ensure_directory(output_path)
 
         dialog = SanitizeProgressDialog(self, binary_path.name or entry.name)
-        worker = SanitizeWorker(entry.entry_id, binary_path, log_path, output_path)
+        worker = SanitizeWorker(
+            entry.entry_id,
+            binary_path,
+            log_path,
+            output_path,
+            sanitize_options,
+            executed_addresses=report.addresses,
+            parsed_rows=report.parsed_rows,
+            instruction_samples=report.sampled_instructions,
+        )
         thread = QThread(self)
         worker.moveToThread(thread)
 
@@ -1739,6 +1895,7 @@ class App(QMainWindow):
             return
         self.selected_binary = binary
         self.binary_path.setText(binary)
+        self._update_honey_entries_label()
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         default_name = f"{Path(binary).name} @ {timestamp}"
         name, ok = QInputDialog.getText(self, "Execute Binary", "Run name:", text=default_name)
@@ -1840,9 +1997,9 @@ class App(QMainWindow):
         entry = self._entry_from_item(current)
         if entry:
             name = Path(entry.binary_path).name or entry.binary_path
-            self.logs_exec_label.setText(f"Executable: {name}")
+            self.logs_exec_label.setText(f"Execution Logs for: {name}")
         else:
-            self.logs_exec_label.setText("Executable: None")
+            self.logs_exec_label.setText("Execution Logs for: None")
         self._update_log_preview(entry)
 
     def _record_run_entry(
@@ -1870,7 +2027,7 @@ class App(QMainWindow):
         )
         self.run_entries.append(entry)
         self._refresh_entry_views(entry.entry_id)
-        self.logs_exec_label.setText(f"Executable: {Path(binary_path).name}")
+        self.logs_exec_label.setText(f"Execution Logs for: {Path(binary_path).name}")
         self._persist_current_history()
 
     def _refresh_entry_views(self, newly_added_id: str | None = None) -> None:
@@ -1985,6 +2142,7 @@ class App(QMainWindow):
                     )
                 else:
                     self.honey_parent_status.setText("Sanitized replay: Not generated.")
+            self._update_honey_entries_label()
 
     def _detect_revng(self, *, allow_prompt: bool = True) -> tuple[bool, str]:
         self._ensure_revng_wrapper_exists(quiet_if_current=True)
@@ -2243,18 +2401,32 @@ class App(QMainWindow):
                 started, message = self._start_revng_container()
             finally:
                 QApplication.restoreOverrideCursor()
-            self._refresh_revng_container_status(verbose=True, allow_prompt=True)
+            status_label.setText(message or "Rev.ng container start attempted.")
+            status_label.repaint()
+
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            status_label.setText("Refreshing rev.ng status…")
+            try:
+                self._refresh_revng_status(verbose=True, allow_prompt=True)
+            finally:
+                QApplication.restoreOverrideCursor()
             refresh_labels()
+
+            ready = self._revng_cli_available and self._revng_container_running
+            progress_bar.hide()
+            if ready:
+                status_label.setText("rev.ng CLI and container are ready.")
+                dialog.accept()
+                return
+
             if started:
-                progress_bar.hide()
-                status_label.setText(message or "rev.ng container started.")
-                if self._revng_cli_available and self._revng_container_running:
-                    dialog.accept()
-                    return
+                status_label.setText(
+                    (message or "rev.ng container started.")
+                    + " but CLI is still unavailable."
+                )
             else:
-                progress_bar.hide()
                 status_label.setText(message or "Failed to start rev.ng container.")
-                QMessageBox.critical(dialog, "rev.ng", status_label.text())
+            QMessageBox.critical(dialog, "rev.ng", status_label.text())
             start_button.setEnabled(True)
 
         start_button.clicked.connect(handle_start)
@@ -2281,6 +2453,32 @@ class App(QMainWindow):
         if hasattr(self, "honey_compare_button"):
             self.honey_compare_button.setEnabled(has_entry and compare_ready and not busy)
 
+    def _honey_entries_heading(self) -> str:
+        entry = self._current_honey_entry()
+        candidate: str | None = None
+        if entry and entry.binary_path:
+            candidate = entry.binary_path
+        elif entry and entry.name:
+            candidate = entry.name
+        elif getattr(self, "selected_binary", None):
+            candidate = self.selected_binary
+        elif getattr(self, "config", None):
+            candidate = (self.config.binary_path or "").strip() or None
+        if candidate:
+            try:
+                display = Path(candidate).name or candidate
+            except Exception:
+                display = candidate
+        else:
+            display = "HoneyPot"
+        return f"Execution Logs for {display}"
+
+    def _update_honey_entries_label(self) -> None:
+        label = getattr(self, "honey_entries_label", None)
+        if label is None:
+            return
+        label.setText(self._honey_entries_heading())
+
     def _handle_logs_selection_change(self, current: QListWidgetItem | None, previous: QListWidgetItem | None) -> None:
         self.update_log_detail_from_selection(current, previous)
         entry = self._entry_from_item(current)
@@ -2295,6 +2493,7 @@ class App(QMainWindow):
         entry_id = entry.entry_id if entry else None
         self._sync_selection_to_entry(self.logs_list, entry_id)
         self._update_honey_detail(entry)
+        self._update_honey_entries_label()
 
     def _refresh_log_preview_only(self) -> None:
         if self._cached_log_lines:
@@ -2315,9 +2514,9 @@ class App(QMainWindow):
             self.delete_log_button.setEnabled(entry is not None)
         if entry and entry.binary_path:
             binary_name = Path(entry.binary_path).name or entry.binary_path
-            self.logs_exec_label.setText(f"Executable: {binary_name}")
+            self.logs_exec_label.setText(f"Execution Logs for: {binary_name}")
         else:
-            self.logs_exec_label.setText("Executable: None")
+            self.logs_exec_label.setText("Execution Logs for: None")
         if entry and entry.log_path:
             path = Path(entry.log_path)
             self.log_preview_label.setText("Instruction Trace")
@@ -3189,11 +3388,56 @@ class App(QMainWindow):
             )
             return
 
-        output_path = self._sanitized_output_path(entry)
+        default_output_path = self._sanitized_output_path(entry)
+        report = None
+        analyze_dialog = self._show_busy_dialog("Analyzing instruction log...", title="Preparing Sanitization")
+        try:
+            try:
+                report = collect_executed_addresses(log_path)
+            except Exception as exc:
+                QMessageBox.critical(
+                    self,
+                    "Unable to analyze log",
+                    f"Failed to parse instruction log before sanitization:\n{exc}",
+                )
+                self._append_console(f"Sanitization aborted: {exc}")
+                return
+        finally:
+            analyze_dialog.close()
+        if not report or not report.addresses:
+            QMessageBox.warning(
+                self,
+                "No instructions",
+                "The selected log does not contain any executed instruction entries.",
+            )
+            return
+        sanity_allowed = bool(report.sampled_instructions)
+        config_dialog = SanitizeConfigDialog(
+            self,
+            default_name=default_output_path.name,
+            default_permissions=binary_path.stat().st_mode,
+            sanity_allowed=sanity_allowed,
+        )
+        if config_dialog.exec() != QDialog.Accepted:
+            self._append_console("Sanitization cancelled before launch.")
+            return
+        sanitize_options = config_dialog.selected_options()
+        output_path = default_output_path
+        if sanitize_options.output_name:
+            output_path = default_output_path.with_name(sanitize_options.output_name)
         self._ensure_directory(output_path)
 
         dialog = SanitizeProgressDialog(self, binary_path.name or entry.name)
-        worker = SanitizeWorker(entry.entry_id, binary_path, log_path, output_path)
+        worker = SanitizeWorker(
+            entry.entry_id,
+            binary_path,
+            log_path,
+            output_path,
+            sanitize_options,
+            executed_addresses=report.addresses,
+            parsed_rows=report.parsed_rows,
+            instruction_samples=report.sampled_instructions,
+        )
         thread = QThread(self)
         worker.moveToThread(thread)
 

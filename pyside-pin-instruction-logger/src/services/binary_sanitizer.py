@@ -29,6 +29,9 @@ class BinarySanitizer:
         binary_path: Path,
         executed_addresses: set[int],
         output_path: Path,
+        *,
+        forced_mode: int | None = None,
+        binary: lief.Binary | None = None,
     ) -> SanitizationResult:
         if not binary_path.exists():
             raise FileNotFoundError(f"Binary not found: {binary_path}")
@@ -40,15 +43,15 @@ class BinarySanitizer:
         except OSError as exc:
             raise OSError(f"Unable to inspect permissions for {binary_path}: {exc}") from exc
 
-        binary = lief.parse(str(binary_path))
-        arch, mode, nop_generator = self._capstone_config(binary)
+        binary_obj = binary if binary is not None else lief.parse(str(binary_path))
+        arch, mode, nop_generator = self._capstone_config(binary_obj)
         md = capstone.Cs(arch, mode)
         md.detail = False
 
         total = 0
         patched = 0
 
-        for section in self._executable_sections(binary):
+        for section in self._executable_sections(binary_obj):
             data = bytes(section.content)
             if not data:
                 continue
@@ -58,13 +61,14 @@ class BinarySanitizer:
                 if address in executed_addresses:
                     continue
                 nop_bytes = nop_generator(instruction.size)
-                self._patch_bytes(binary, address, nop_bytes)
+                self._patch_bytes(binary_obj, address, nop_bytes)
                 patched += 1
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        binary.write(str(output_path))
+        binary_obj.write(str(output_path))
+        target_mode = stat.S_IMODE(forced_mode if forced_mode is not None else original_mode)
         try:
-            os.chmod(output_path, stat.S_IMODE(original_mode))
+            os.chmod(output_path, target_mode)
         except OSError as exc:
             raise OSError(
                 f"Failed to apply executable permissions to sanitized binary {output_path}: {exc}"
@@ -109,6 +113,49 @@ class BinarySanitizer:
 
     def _patch_bytes(self, binary: lief.Binary, address: int, data: bytes) -> None:
         binary.patch_address(address, list(data))
+
+    def sanity_check(self, binary_path: Path) -> None:
+        if not binary_path.exists():
+            raise FileNotFoundError(f"Sanitized binary not found at {binary_path}")
+        try:
+            lief.parse(str(binary_path))
+        except Exception as exc:  # pragma: no cover - defensive
+            raise RuntimeError(f"Unable to parse sanitized binary via LIEF: {exc}") from exc
+        if not os.access(binary_path, os.X_OK):
+            raise PermissionError(f"Sanitized binary is not executable: {binary_path}")
+
+    def verify_logged_instructions(
+        self,
+        binary: lief.Binary,
+        samples: list[tuple[int, str]],
+        *,
+        max_bytes: int = 16,
+    ) -> None:
+        if not samples:
+            return
+        arch, mode, _ = self._capstone_config(binary)
+        md = capstone.Cs(arch, mode)
+        md.detail = False
+        for address, expected in samples:
+            expected_clean = (expected or "").strip()
+            if not expected_clean:
+                continue
+            try:
+                raw = binary.get_content_from_virtual_address(address, max_bytes)
+            except Exception as exc:  # pragma: no cover - defensive
+                raise RuntimeError(f"Unable to read bytes at 0x{address:x}: {exc}") from exc
+            data = bytes(raw)
+            if not data:
+                raise RuntimeError(f"No bytes available at 0x{address:x} for verification")
+            insn_iter = md.disasm(data, address)
+            instruction = next(insn_iter, None)
+            if instruction is None:
+                raise RuntimeError(f"Unable to disassemble instruction at 0x{address:x}")
+            actual = f"{instruction.mnemonic} {instruction.op_str}".strip()
+            if actual.lower() != expected_clean.lower():
+                raise RuntimeError(
+                    f"Instruction mismatch at 0x{address:x}: expected '{expected_clean}', got '{actual}'"
+                )
 
     def _resolve_elf_execinstr_flag(self) -> int:
         elf_module = getattr(lief, "ELF", None)
