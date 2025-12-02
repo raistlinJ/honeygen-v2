@@ -31,6 +31,7 @@ class BinarySanitizer:
         output_path: Path,
         *,
         forced_mode: int | None = None,
+        only_text_section: bool = False,
         binary: lief.Binary | None = None,
     ) -> SanitizationResult:
         if not binary_path.exists():
@@ -51,7 +52,14 @@ class BinarySanitizer:
         total = 0
         patched = 0
 
-        for section in self._executable_sections(binary_obj):
+        sections = list(self._executable_sections(binary_obj))
+        if only_text_section:
+            text_sections = [section for section in sections if self._is_text_section(section)]
+            if not text_sections:
+                raise ValueError("No executable .text sections found in the binary for sanitization.")
+            sections = text_sections
+
+        for section in sections:
             data = bytes(section.content)
             if not data:
                 continue
@@ -110,6 +118,10 @@ class BinarySanitizer:
                     yield section
         else:
             raise NotImplementedError("Executable section detection only supports ELF binaries at the moment")
+
+    def _is_text_section(self, section: lief.Section) -> bool:
+        name = getattr(section, "name", "") or ""
+        return name.lower().startswith(".text")
 
     def _patch_bytes(self, binary: lief.Binary, address: int, data: bytes) -> None:
         binary.patch_address(address, list(data))

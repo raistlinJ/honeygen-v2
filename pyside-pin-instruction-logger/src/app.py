@@ -235,6 +235,7 @@ class SanitizeWorker(QObject):
                 executed,
                 self.output_path,
                 forced_mode=self.options.permissions_mask,
+                only_text_section=self.options.only_text_section,
                 binary=binary_obj,
             )
             if self.options.sanity_check:
@@ -250,6 +251,7 @@ class SanitizeOptions(NamedTuple):
     sanity_check: bool
     output_name: str | None
     permissions_mask: int | None
+    only_text_section: bool
 
 
 class BuildProgressDialog(QDialog):
@@ -359,6 +361,10 @@ class SanitizeConfigDialog(QDialog):
             self.sanity_checkbox.setToolTip("Sanity check unavailable: no executed instructions detected.")
         layout.addWidget(self.sanity_checkbox)
 
+        self.only_text_checkbox = QCheckBox("Only .text section", self)
+        self.only_text_checkbox.setToolTip("Restrict sanitization to instructions located in the binary's .text sections.")
+        layout.addWidget(self.only_text_checkbox)
+
         filename_row = QHBoxLayout()
         filename_row.addWidget(QLabel("Output filename:", self))
         self.filename_input = QLineEdit(default_name, self)
@@ -397,6 +403,7 @@ class SanitizeConfigDialog(QDialog):
             sanity_check=self.sanity_checkbox.isChecked(),
             output_name=safe_name,
             permissions_mask=permissions,
+            only_text_section=self.only_text_checkbox.isChecked(),
         )
 
     def _build_permissions_mask(self) -> int:
