@@ -1,5 +1,7 @@
-PySide2
-intel-pin
+PySide6==6.6.3
+# intel-pin is distributed separately from PyPI; install it manually if needed.
 pytest
+pytest-qt>=4.0.0
+pytest-timeout>=2.3.1
 capstone>=5.0.0
 lief>=0.14.0

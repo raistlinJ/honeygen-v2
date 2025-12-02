@@ -8,7 +8,7 @@ Project-URL: Homepage, https://github.com/yourusername/pyside-pin-instruction-lo
 Project-URL: Repository, https://github.com/yourusername/pyside-pin-instruction-logger
 Requires-Python: >=3.9
 Description-Content-Type: text/markdown
-Requires-Dist: PySide6<7,>=6.6
+Requires-Dist: PySide6==6.6.3
 Requires-Dist: numpy>=1.26
 Requires-Dist: pandas>=2.2
 
@@ -73,7 +73,7 @@ pyside-pin-instruction-logger
 
 ## Usage
 
-- Use the application interface to specify the binary file you want to run with Intel PIN.
+- Use the application interface to specify the Intel PIN directory once, choose the log destination, and pick the binary you want to run; the app remembers your selections between sessions.
 - The bundled CLI mirrors the UI workflow for quick tests:
    ```
    uv run python scripts/run_with_pin.py ./path/to/binary -- --arg1 --arg2

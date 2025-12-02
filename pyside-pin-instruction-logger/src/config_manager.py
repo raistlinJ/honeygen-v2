@@ -19,7 +19,6 @@ class AppConfig:
     log_path: str = str(DEFAULT_LOG_PATH)
     binary_path: str = ""
     tool_path: str = str(DEFAULT_TOOL_PATH)
-    ghidra_path: str = ""
     projects: list[str] = field(default_factory=lambda: ["Default Project"])
     active_project: str | None = None
     revng_docker_image: str = "revng/revng"

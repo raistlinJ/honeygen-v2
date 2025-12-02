@@ -4,11 +4,90 @@
 #include <memory>
 #include <sstream>
 #include <iomanip>
+#include <algorithm>
+#include <cctype>
+#include <string>
 #include "pin.H"
 
 std::ofstream logFile;
 std::vector<std::unique_ptr<std::string>> g_disassembly_cache;
 PIN_LOCK g_log_lock;
+std::vector<std::string> g_allowed_modules;
+bool g_trace_all_modules = false;
+
+KNOB<std::string> KnobModules(
+    KNOB_MODE_WRITEONCE,
+    "pintool",
+    "modules",
+    "",
+    "Comma-separated module names to trace (use * to include every module)."
+);
+
+static std::string ToLower(const std::string &value) {
+    std::string lowered = value;
+    std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return lowered;
+}
+
+static std::string ExtractBasename(const std::string &path) {
+    size_t pos = path.find_last_of("/\\");
+    if (pos == std::string::npos) {
+        return path;
+    }
+    return path.substr(pos + 1);
+}
+
+static void ConfigureModuleFilters() {
+    std::string raw = KnobModules.Value();
+    if (raw.empty()) {
+        return;
+    }
+    std::stringstream stream(raw);
+    std::string token;
+    while (std::getline(stream, token, ',')) {
+        size_t start = token.find_first_not_of(" \t");
+        if (start == std::string::npos) {
+            continue;
+        }
+        size_t end = token.find_last_not_of(" \t");
+        std::string trimmed = token.substr(start, end - start + 1);
+        std::string lowered = ToLower(trimmed);
+        if (lowered.empty()) {
+            continue;
+        }
+        if (lowered == "*" || lowered == "all") {
+            g_trace_all_modules = true;
+            g_allowed_modules.clear();
+            return;
+        }
+        g_allowed_modules.push_back(lowered);
+    }
+}
+
+static BOOL ModuleAllowed(IMG image) {
+    if (!IMG_Valid(image)) {
+        return FALSE;
+    }
+    if (g_trace_all_modules) {
+        return TRUE;
+    }
+    if (g_allowed_modules.empty()) {
+        return IMG_IsMainExecutable(image);
+    }
+    std::string full_name = ToLower(IMG_Name(image));
+    std::string base_name = ToLower(ExtractBasename(full_name));
+    for (const auto &filter : g_allowed_modules) {
+        if (filter.empty()) {
+            continue;
+        }
+        if (full_name.find(filter) != std::string::npos || base_name == filter) {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
 
 static BOOL FollowChild(CHILD_PROCESS childProcess, VOID * /* val */) {
     // Always follow forked children to keep logging coverage intact.
@@ -16,15 +95,11 @@ static BOOL FollowChild(CHILD_PROCESS childProcess, VOID * /* val */) {
 }
 
 static BOOL IsApplicationInstruction(INS ins) {
-    SEC section = INS_Sec(ins);
-    if (!SEC_Valid(section)) {
-        return FALSE;
-    }
-    IMG image = SEC_Img(section);
+    IMG image = IMG_FindByAddress(INS_Address(ins));
     if (!IMG_Valid(image)) {
         return FALSE;
     }
-    return IMG_IsMainExecutable(image);
+    return ModuleAllowed(image);
 }
 
 VOID recordInstruction(THREADID tid, ADDRINT address, const std::string *disassembly) {
@@ -70,6 +145,7 @@ int main(int argc, char *argv[]) {
 
     PIN_InitLock(&g_log_lock);
     PIN_Init(argc, argv);
+    ConfigureModuleFilters();
     INS_AddInstrumentFunction(instruction, 0);
     PIN_AddFollowChildProcessFunction(FollowChild, nullptr);
     PIN_AddFiniFunction(Fini, 0);

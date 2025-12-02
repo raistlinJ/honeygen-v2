@@ -25,6 +25,14 @@ class HistoryStore:
                 timestamp = datetime.fromisoformat(raw.get("timestamp", ""))
             except ValueError:
                 timestamp = datetime.now()
+            prepared_segments = self._parse_segments(raw.get("prepared_segments"))
+            prepared_at_raw = raw.get("prepared_at")
+            prepared_at = None
+            if prepared_at_raw:
+                try:
+                    prepared_at = datetime.fromisoformat(prepared_at_raw)
+                except ValueError:
+                    prepared_at = None
             entries.append(
                 RunEntry(
                     entry_id=raw.get("entry_id") or str(uuid4()),
@@ -35,6 +43,8 @@ class HistoryStore:
                     sanitized_binary_path=raw.get("sanitized_binary_path"),
                     parent_entry_id=raw.get("parent_entry_id"),
                     is_sanitized_run=raw.get("is_sanitized_run", False),
+                    prepared_segments=prepared_segments or None,
+                    prepared_at=prepared_at,
                 )
             )
         return entries
@@ -79,6 +89,8 @@ class HistoryStore:
             "sanitized_binary_path": entry.sanitized_binary_path,
             "parent_entry_id": entry.parent_entry_id,
             "is_sanitized_run": entry.is_sanitized_run,
+            "prepared_segments": self._format_segments(entry.prepared_segments),
+            "prepared_at": entry.prepared_at.isoformat() if entry.prepared_at else None,
         }
 
     def _read_all(self) -> dict[str, list[dict[str, Any]]]:
@@ -91,3 +103,31 @@ class HistoryStore:
 
     def _write_all(self, data: dict[str, Any]) -> None:
         self.path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+    def _parse_segments(self, raw_segments: Any) -> list[tuple[int, int]]:
+        segments: list[tuple[int, int]] = []
+        if not raw_segments:
+            return segments
+        for item in raw_segments:
+            if isinstance(item, dict):
+                start = item.get("start")
+                end = item.get("end")
+            elif isinstance(item, (list, tuple)) and len(item) == 2:
+                start, end = item
+            else:
+                continue
+            try:
+                start_int = int(start)
+                end_int = int(end)
+            except (TypeError, ValueError):
+                continue
+            segments.append((start_int, end_int))
+        return segments
+
+    def _format_segments(self, segments: list[tuple[int, int]] | None) -> list[dict[str, int]]:
+        formatted: list[dict[str, int]] = []
+        if not segments:
+            return formatted
+        for start, end in segments:
+            formatted.append({"start": int(start), "end": int(end)})
+        return formatted

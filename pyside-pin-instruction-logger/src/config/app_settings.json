@@ -3,7 +3,6 @@
   "log_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/pin_logs/instruction_log.txt",
   "binary_path": "/bin/ls",
   "tool_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/pin-tool/obj-intel64/ins_logger.so",
-  "ghidra_path": "",
   "projects": [
     "Default Project",
     "ls_honeypot"

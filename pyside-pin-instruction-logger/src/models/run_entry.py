@@ -20,6 +20,8 @@ class RunEntry:
     sanitized_binary_path: str | None = None
     parent_entry_id: str | None = None
     is_sanitized_run: bool = False
+    prepared_segments: list[tuple[int, int]] | None = None
+    prepared_at: datetime | None = None
 
     def label(self) -> str:
         prefix = "[SAN] " if self.is_sanitized_run else ""

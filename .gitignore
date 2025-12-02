@@ -6,3 +6,5 @@ pyside-pin-instruction-logger/uv.lock
 pyside-pin-instruction-logger/pin_logs/
 
 pyside-pin-instruction-logger/instruction_log.txt
+
+pyside-pin-instruction-logger/src/__pycache__/

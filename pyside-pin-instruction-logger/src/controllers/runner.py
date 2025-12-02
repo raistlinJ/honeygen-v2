@@ -1,6 +1,6 @@
 from pathlib import Path
 import subprocess
-from typing import Callable
+from typing import Callable, Sequence
 
 from services.pin_runner import PinRunner
 
@@ -43,9 +43,15 @@ class RunnerController:
         binary_path: str,
         *,
         log_path: str | None = None,
+        module_filters: Sequence[str] | None = None,
         on_output: Callable[[str], None] | None = None,
     ) -> Path:
-        return self.pin_runner.run(binary_path, log_path=log_path, on_output=on_output)
+        return self.pin_runner.run(
+            binary_path,
+            log_path=log_path,
+            modules=module_filters,
+            on_output=on_output,
+        )
 
     def stop_logging(self) -> None:
         self.pin_runner.stop()

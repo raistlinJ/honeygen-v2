@@ -1,4 +1,6 @@
 app
+config
+config_manager
 controllers
 models
 services

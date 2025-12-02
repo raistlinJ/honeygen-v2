@@ -47,6 +47,21 @@ class TestBinarySanitizerVerification(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.sanitizer.verify_logged_instructions(self.binary, [(address, mismatched_text)])
 
+    def test_preview_instructions_matches_reference(self) -> None:
+        address, text = self._reference_instruction
+        preview = self.sanitizer.preview_instructions(self.binary, [address])
+        self.assertTrue(preview, "Preview should return at least one row")
+        preview_address, preview_text = preview[0]
+        self.assertEqual(preview_address, address)
+        self.assertEqual(preview_text.lower(), text.lower())
+
+    def test_preview_instructions_accepts_processed_rows(self) -> None:
+        address, _ = self._reference_instruction
+        processed = [{"address": hex(address)}, (hex(address), "ignored"), address]
+        preview = self.sanitizer.preview_instructions(self.binary, processed)
+        self.assertEqual(len(preview), 1)
+        self.assertEqual(preview[0][0], address)
+
 
 if __name__ == "__main__":
     unittest.main()

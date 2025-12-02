@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 import shutil
 import string
 import sys
@@ -11,10 +12,13 @@ import stat
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, NamedTuple
+from bisect import bisect_left, bisect_right
+from collections import deque
 
 import lief
+import capstone
 
-from PySide6.QtCore import Qt, QObject, QThread, Signal, QUrl
+from PySide6.QtCore import Qt, QObject, QThread, Signal, Slot, QUrl, QTimer
 from PySide6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -44,15 +48,17 @@ from PySide6.QtWidgets import (
     QTableWidgetItem,
     QHeaderView,
     QSizePolicy,
+    QStackedWidget,
 )
-from PySide6.QtGui import QDesktopServices, QAction
+from PySide6.QtGui import QDesktopServices, QAction, QFont, QColor, QIcon, QPainter, QPixmap
 
 from controllers.runner import RunnerController
 from config_manager import AppConfig, ConfigManager, DEFAULT_LOG_PATH
 from models.run_entry import RunEntry
 from services.history_store import HistoryStore
-from services.log_analyzer import collect_executed_addresses
-from services.binary_sanitizer import BinarySanitizer, SanitizationResult
+from services import parser
+from services.log_analyzer import collect_executed_addresses, compute_address_segments
+from services.binary_sanitizer import BinarySanitizer, SanitizationResult, PreviewCancelled
 
 
 def _docker_revng_instructions(image: str = "revng/revng") -> str:
@@ -64,6 +70,38 @@ def _docker_revng_instructions(image: str = "revng/revng") -> str:
         f"  docker run --rm -it {repo} revng --version\n\n"
         "Create a helper script (e.g., ~/bin/revng) that wraps the docker run command, then add it to PATH."
     )
+
+
+HONEY_SEGMENT_MAX_GAP = 0x20
+SEGMENT_EDGE_PREVIEW_LIMIT = 500
+SANITIZATION_PREVIEW_ADDRESS_LIMIT = 0
+SEQUENCE_ANALYZER_MAX_BINARY_INSTRUCTIONS = 20000
+SEQUENCE_ANALYZER_MAX_TRACE_MATCHES = 5000
+
+
+def _resize_widget_to_screen(
+    widget: QWidget,
+    *,
+    width_ratio: float = 0.8,
+    height_ratio: float = 0.8,
+    min_width: int = 960,
+    min_height: int = 600,
+) -> None:
+    """Resize a dialog-scale widget to occupy a large portion of the current screen."""
+    screen = widget.screen() or QApplication.primaryScreen()
+    if screen is None:
+        widget.resize(min_width, min_height)
+        return
+    geometry = screen.availableGeometry()
+    width = max(int(geometry.width() * width_ratio), min_width)
+    height = max(int(geometry.height() * height_ratio), min_height)
+    widget.resize(width, height)
+
+
+class LogIndicator(NamedTuple):
+    color: str
+    tooltip: str
+    state: str
 
 
 class ClickableIndicator(QLabel):
@@ -84,17 +122,25 @@ class RunWorker(QObject):
     succeeded = Signal(str)
     failed = Signal(str)
 
-    def __init__(self, controller: RunnerController, binary_path: str, log_path: str | None) -> None:
+    def __init__(
+        self,
+        controller: RunnerController,
+        binary_path: str,
+        log_path: str | None,
+        module_filters: list[str] | None = None,
+    ) -> None:
         super().__init__()
         self.controller = controller
         self.binary_path = binary_path
         self.log_path = log_path
+        self.module_filters = list(module_filters) if module_filters else None
 
     def run(self) -> None:
         try:
             result = self.controller.run_binary(
                 self.binary_path,
                 log_path=self.log_path,
+                module_filters=self.module_filters,
                 on_output=self.output.emit,
             )
             self.succeeded.emit(str(result))
@@ -129,6 +175,7 @@ class RunProgressDialog(QDialog):
         layout.addWidget(self.output_view)
         layout.addWidget(self.progress_bar)
         layout.addWidget(self.buttons)
+        self.resize(760, 520)
 
     def append_output(self, text: str) -> None:
         self.output_view.appendPlainText(text)
@@ -162,6 +209,623 @@ class RunProgressDialog(QDialog):
         self.status_label.setText("Stopping run...")
         self.append_output("Stop requested. Attempting to terminate run...")
         self._stop_callback()
+
+
+class ModuleSelectionDialog(QDialog):
+    def __init__(
+        self,
+        parent: QWidget,
+        binary_label: str,
+        modules: list[str],
+        *,
+        default_log_label: str,
+        filename_builder: Callable[[str], str] | None = None,
+        previous_selection: list[str] | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"Select Modules — {binary_label}")
+        self._modules = modules
+        self._previous = list(previous_selection or [])
+        self._filename_builder = filename_builder
+        layout = QVBoxLayout(self)
+        description = QLabel(
+            "Choose which modules to monitor while collecting the instruction log. "
+            "Capturing more modules may slow down execution but provides broader coverage.",
+            self,
+        )
+        description.setWordWrap(True)
+        layout.addWidget(description)
+
+        name_container = QVBoxLayout()
+        name_label = QLabel("Log output name", self)
+        self.log_label_input = QLineEdit(default_log_label, self)
+        name_container.addWidget(name_label)
+        name_container.addWidget(self.log_label_input)
+        self.log_filename_value = QLabel(self)
+        self.log_filename_value.setStyleSheet("color: #666;")
+        name_container.addWidget(self.log_filename_value)
+        layout.addLayout(name_container)
+
+        self.trace_all_checkbox = QCheckBox("Capture instructions from every loaded module (slow)", self)
+        layout.addWidget(self.trace_all_checkbox)
+
+        self.module_list = QListWidget(self)
+        self.module_list.setSelectionMode(QAbstractItemView.NoSelection)
+        layout.addWidget(self.module_list)
+
+        controls_row = QHBoxLayout()
+        self.select_all_button = QPushButton("Select All", self)
+        self.clear_button = QPushButton("Clear", self)
+        controls_row.addWidget(self.select_all_button)
+        controls_row.addWidget(self.clear_button)
+        controls_row.addStretch(1)
+        layout.addLayout(controls_row)
+
+        add_row = QHBoxLayout()
+        self.custom_input = QLineEdit(self)
+        self.custom_input.setPlaceholderText("Add custom module name (e.g., libc.so.6)")
+        self.add_button = QPushButton("Add", self)
+        add_row.addWidget(self.custom_input, 1)
+        add_row.addWidget(self.add_button)
+        layout.addLayout(add_row)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Cancel | QDialogButtonBox.Ok, self)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self.log_label_input.textChanged.connect(self._handle_log_label_changed)
+        self.trace_all_checkbox.toggled.connect(self._handle_trace_all_toggled)
+        self.select_all_button.clicked.connect(lambda: self._set_all_items(Qt.Checked))
+        self.clear_button.clicked.connect(lambda: self._set_all_items(Qt.Unchecked))
+        self.add_button.clicked.connect(self._handle_add_custom)
+
+        self._populate_list()
+        self._restore_previous_selection()
+        self._handle_log_label_changed(self.log_label_input.text())
+        self.resize(760, 560)
+
+    def _populate_list(self) -> None:
+        seen: set[str] = set()
+        for name in self._modules:
+            normalized = self._normalize_entry(name)
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            item = QListWidgetItem(normalized, self.module_list)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Unchecked)
+
+    def _restore_previous_selection(self) -> None:
+        if not self._previous:
+            if self.module_list.count() > 0:
+                self.module_list.item(0).setCheckState(Qt.Checked)
+            return
+        lowered = {entry.lower() for entry in self._previous}
+        if any(entry in {"*", "all"} for entry in lowered):
+            self.trace_all_checkbox.setChecked(True)
+            return
+        for row in range(self.module_list.count()):
+            item = self.module_list.item(row)
+            if item.text().lower() in lowered:
+                item.setCheckState(Qt.Checked)
+
+    def _set_all_items(self, state: Qt.CheckState) -> None:
+        for row in range(self.module_list.count()):
+            item = self.module_list.item(row)
+            item.setCheckState(state)
+
+    def _handle_trace_all_toggled(self, checked: bool) -> None:
+        self.module_list.setEnabled(not checked)
+        self.select_all_button.setEnabled(not checked)
+        self.clear_button.setEnabled(not checked)
+        self.custom_input.setEnabled(not checked)
+        self.add_button.setEnabled(not checked)
+
+    def _handle_add_custom(self) -> None:
+        entry = self._normalize_entry(self.custom_input.text())
+        if not entry:
+            return
+        if not any(self.module_list.item(row).text().lower() == entry.lower() for row in range(self.module_list.count())):
+            item = QListWidgetItem(entry, self.module_list)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked)
+        self.custom_input.clear()
+
+    @staticmethod
+    def _normalize_entry(value: str | None) -> str:
+        text = (value or "").strip()
+        return text
+
+    def selected_modules(self) -> list[str]:
+        if self.trace_all_checkbox.isChecked():
+            return ["*"]
+        selection: list[str] = []
+        for row in range(self.module_list.count()):
+            item = self.module_list.item(row)
+            if item.checkState() == Qt.Checked:
+                selection.append(item.text())
+        return selection
+
+    def selected_log_label(self) -> str:
+        return self.log_label_input.text().strip()
+
+    def accept(self) -> None:  # type: ignore[override]
+        if not self.trace_all_checkbox.isChecked() and not self.selected_modules():
+            QMessageBox.warning(self, "No modules selected", "Select at least one module or enable 'Capture every module'.")
+            return
+        if not self.selected_log_label():
+            QMessageBox.warning(self, "Missing log name", "Provide a log output name before continuing.")
+            return
+        super().accept()
+
+    def _handle_log_label_changed(self, text: str) -> None:
+        if not self._filename_builder:
+            self.log_filename_value.setText(text.strip() or "")
+            return
+        try:
+            formatted = self._filename_builder(text)
+        except Exception:
+            formatted = text.strip()
+        self.log_filename_value.setText(formatted or "")
+
+class LogPreviewWorker(QObject):
+    chunk_ready = Signal(object)
+    progress = Signal(object)
+    finished = Signal(bool)
+    failed = Signal(str)
+    cancelled = Signal()
+
+    def __init__(
+        self,
+        path: Path,
+        *,
+        mode: str,
+        max_chars: int,
+        segments: list[tuple[int, int]],
+        per_segment_limit: int,
+    ) -> None:
+        super().__init__()
+        self._path = path
+        self._mode = mode
+        self._max_chars = max_chars
+        self._segments = list(segments)
+        self._per_segment_limit = per_segment_limit
+        self._stop_requested = False
+        self._chunk_size = 200
+        self._segment_sample_counts: dict[int, int] = {}
+        self.job_id: int | None = None
+
+    def cancel(self) -> None:
+        self._stop_requested = True
+
+    def run(self) -> None:  # pragma: no cover - executes in worker threads
+        try:
+            self._run_segments_mode() if self._mode == "segments" else self._run_raw_mode()
+        except Exception as exc:
+            if self._stop_requested:
+                self.cancelled.emit()
+            else:
+                self.failed.emit(str(exc))
+
+    def _run_raw_mode(self) -> None:
+        lines_read = 0
+        total_chars = 0
+        chunk: list[str] = []
+        truncated = False
+        with self._path.open("r", encoding="utf-8", errors="replace") as handle:
+            for raw_line in handle:
+                if self._stop_requested:
+                    self.cancelled.emit()
+                    return
+                line = raw_line.rstrip("\n")
+                chunk.append(line)
+                lines_read += 1
+                total_chars += len(line) + 1
+                if len(chunk) >= self._chunk_size:
+                    self.chunk_ready.emit(list(chunk))
+                    chunk.clear()
+                    self.progress.emit({"lines": lines_read})
+                if self._max_chars > 0 and total_chars >= self._max_chars:
+                    truncated = True
+                    break
+        if chunk:
+            self.chunk_ready.emit(list(chunk))
+            self.progress.emit({"lines": lines_read})
+        self.finished.emit(truncated)
+
+    def _run_segments_mode(self) -> None:
+        segments = self._segments
+        if not segments:
+            self.finished.emit(False)
+            return
+        per_segment_limit = max(self._per_segment_limit, 1)
+        pending: set[int] = set(range(len(segments)))
+        headers_emitted: set[int] = set()
+        starts_cache = [start for start, _ in segments]
+        segment_progress = 0
+
+        def emit_header(idx: int) -> None:
+            nonlocal segment_progress
+            start, end = segments[idx]
+            self.chunk_ready.emit([f"Segment {idx + 1}: 0x{start:x} - 0x{end:x}"])
+            segment_progress += 1
+            self.progress.emit({"segments": segment_progress})
+
+        try:
+            iterator = parser.iter_log_entries(self._path)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+
+        for parsed in iterator:
+            if self._stop_requested:
+                self.cancelled.emit()
+                return
+            address_text = parsed.get("address") if isinstance(parsed, dict) else None
+            if not address_text:
+                continue
+            try:
+                address_value = int(address_text, 16)
+            except ValueError:
+                continue
+            pos = bisect_right(starts_cache, address_value) - 1
+            if pos not in pending:
+                continue
+            start, end = segments[pos]
+            if not (start <= address_value <= end):
+                continue
+            if pos not in headers_emitted:
+                emit_header(pos)
+                headers_emitted.add(pos)
+            instruction = (parsed.get("instruction", "") if isinstance(parsed, dict) else "").strip()
+            display = f"{address_text}: {instruction}" if instruction else address_text
+            self.chunk_ready.emit([f"    {display}"])
+            if per_segment_limit <= 1:
+                pending.discard(pos)
+            else:
+                self._track_segment_sample(pos, per_segment_limit, pending)
+            if not pending:
+                break
+
+        if self._stop_requested:
+            self.cancelled.emit()
+            return
+
+        for idx in range(len(segments)):
+            if idx in headers_emitted:
+                continue
+            emit_header(idx)
+            self.chunk_ready.emit(["    <no matching instructions in this preview>"])
+        self.finished.emit(False)
+
+    def _track_segment_sample(self, idx: int, limit: int, pending: set[int]) -> None:
+        current = self._segment_sample_counts.get(idx, 0) + 1
+        self._segment_sample_counts[idx] = current
+        if current >= limit:
+            pending.discard(idx)
+
+
+class SanitizationPreviewWorker(QObject):
+    progress = Signal(int, int)
+    info = Signal(str)
+    failed = Signal(str)
+    succeeded = Signal(object)
+    cancelled = Signal()
+
+    def __init__(self, log_path: Path, binary_path: Path, *, address_limit: int = 0) -> None:
+        super().__init__()
+        self._log_path = log_path
+        self._binary_path = binary_path
+        self._address_limit = max(0, address_limit)
+        self._stop_requested = False
+
+    def cancel(self) -> None:
+        self._stop_requested = True
+
+    def run(self) -> None:  # pragma: no cover - worker thread
+        try:
+            addresses, logged_lookup, truncated = _collect_preview_addresses(str(self._log_path), self._address_limit)
+        except Exception as exc:
+            self.failed.emit(f"Unable to collect preview addresses: {exc}")
+            return
+        if self._stop_requested:
+            self.cancelled.emit()
+            return
+        if not addresses:
+            self.info.emit("The instruction log did not contain any recognizable addresses.")
+            return
+        total = len(addresses)
+        self.progress.emit(0, total)
+        try:
+            binary_obj = lief.parse(str(self._binary_path))
+        except Exception as exc:
+            self.failed.emit(f"Unable to parse binary for preview: {exc}")
+            return
+        sanitizer = BinarySanitizer()
+        progress_interval = max(total // 200, 1) if total else 1
+        try:
+            preview_rows = sanitizer.preview_instructions(
+                binary_obj,
+                addresses,
+                on_progress=self.progress.emit,
+                should_cancel=lambda: self._stop_requested,
+                progress_interval=progress_interval,
+            )
+        except PreviewCancelled:
+            self.cancelled.emit()
+            return
+        except Exception as exc:
+            self.failed.emit(f"Unable to disassemble preview instructions: {exc}")
+            return
+        combined_rows = [
+            (address, binary_text, logged_lookup.get(address, "")) for address, binary_text in preview_rows
+        ]
+        self.succeeded.emit(
+            {
+                "rows": combined_rows,
+                "truncated": truncated,
+                "limit": self._address_limit,
+                "total": total,
+            }
+        )
+
+
+class GuiInvoker(QObject):
+    invoke = Signal(object)
+
+    def __init__(self, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self.invoke.connect(self._run_callback, Qt.QueuedConnection)
+
+    @Slot(object)
+    def _run_callback(self, callback: object) -> None:
+        if callable(callback):
+            callback()
+
+
+class SegmentPreviewWorker(QObject):
+    result_ready = Signal(object)
+    failed = Signal(str)
+    cancelled = Signal()
+
+    def __init__(
+        self,
+        path: Path,
+        *,
+        start: int,
+        end: int,
+        limit: int,
+    ) -> None:
+        super().__init__()
+        self._path = path
+        self._start = start
+        self._end = end
+        self._limit = max(limit, 1)
+        self._stop_requested = False
+        self.job_id: int | None = None
+
+    def cancel(self) -> None:
+        self._stop_requested = True
+
+    def run(self) -> None:  # pragma: no cover - worker thread
+        try:
+            head: list[str] = []
+            tail: deque[str] = deque(maxlen=self._limit)
+            total = 0
+            for parsed in parser.iter_log_entries(self._path):
+                if self._stop_requested:
+                    self.cancelled.emit()
+                    return
+                address_text = parsed.get("address") if isinstance(parsed, dict) else None
+                if not address_text:
+                    continue
+                try:
+                    address_value = int(address_text, 16)
+                except ValueError:
+                    continue
+                if not (self._start <= address_value <= self._end):
+                    continue
+                instruction = (parsed.get("instruction", "") if isinstance(parsed, dict) else "").strip()
+                display = f"{address_text}: {instruction}" if instruction else address_text
+                total += 1
+                if total <= self._limit:
+                    head.append(display)
+                else:
+                    tail.append(display)
+            tail_list = list(tail)
+            if total <= self._limit:
+                combined = head
+                truncated = False
+            elif total <= self._limit * 2:
+                combined = head + tail_list
+                truncated = False
+            else:
+                combined = head + ["..."] + tail_list
+                truncated = True
+            if self._stop_requested:
+                self.cancelled.emit()
+                return
+            self.result_ready.emit(
+                {
+                    "lines": combined,
+                    "total": total,
+                    "truncated": truncated,
+                    "start": self._start,
+                    "end": self._end,
+                }
+            )
+        except Exception as exc:
+            if self._stop_requested:
+                self.cancelled.emit()
+
+
+class SequenceAnalyzerFindWorker(QObject):
+    progress = Signal(int, int)
+    succeeded = Signal(object)
+    cancelled = Signal()
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        *,
+        trace_rows: list[tuple[int, str, str]],
+        trace_norm: list[str],
+        binary_rows: list[dict[str, object]],
+        binary_start_row: int,
+        sequence: list[str],
+        total_positions: int,
+        progress_interval: int = 256,
+        max_matches: int | None = None,
+    ) -> None:
+        super().__init__()
+        self._trace_rows = list(trace_rows)
+        self._trace_norm = list(trace_norm)
+        self._binary_rows = list(binary_rows)
+        self._binary_start_row = binary_start_row
+        self._needle = [text or "" for text in sequence]
+        self._total_positions = max(total_positions, 0)
+        self._progress_interval = max(progress_interval, 1)
+        self._max_matches = max_matches if max_matches and max_matches > 0 else None
+        self._cancel_requested = False
+        if not (0 <= self._binary_start_row < len(self._binary_rows)):
+            raise ValueError("Binary start row is out of range.")
+        self._binary_start_addr = int(self._binary_rows[self._binary_start_row]["display"])
+
+    def cancel(self) -> None:
+        self._cancel_requested = True
+
+    def run(self) -> None:  # pragma: no cover - worker thread
+        try:
+            needle = self._needle
+            needle_len = len(needle)
+            haystack = self._trace_norm
+            matches: list[dict[str, object]] = []
+            truncated = False
+            if needle_len == 0 or len(haystack) < needle_len:
+                self.succeeded.emit({"matches": matches, "truncated": truncated})
+                return
+            total_possible = max(len(haystack) - needle_len + 1, 0)
+            if total_possible <= 0:
+                self.succeeded.emit({"matches": matches, "truncated": truncated})
+                return
+            total = min(self._total_positions, total_possible) if self._total_positions else total_possible
+            binary_start_addr = self._binary_start_addr
+            processed = 0
+            for idx in range(total):
+                if self._cancel_requested:
+                    self.cancelled.emit()
+                    return
+                window = haystack[idx : idx + needle_len]
+                if window == needle:
+                    trace_start_addr = int(self._trace_rows[idx][0])
+                    offset = trace_start_addr - binary_start_addr
+                    preview_instrs = [
+                        self._trace_rows[idx + delta][2] or ""
+                        for delta in range(min(needle_len, 4))
+                        if idx + delta < len(self._trace_rows)
+                    ]
+                    preview_text = " | ".join(text or "<blank>" for text in preview_instrs)
+                    matches.append(
+                        {
+                            "trace_row": idx,
+                            "trace_start": trace_start_addr,
+                            "offset": offset,
+                            "preview": preview_text,
+                        }
+                    )
+                    if self._max_matches and len(matches) >= self._max_matches:
+                        truncated = True
+                        processed = idx + 1
+                        self.progress.emit(processed, total)
+                        break
+                processed = idx + 1
+                if processed % self._progress_interval == 0 or processed == total:
+                    self.progress.emit(processed, total)
+            if processed < total:
+                self.progress.emit(total, total)
+            self.succeeded.emit({"matches": matches, "truncated": truncated})
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+def _collect_preview_addresses(log_path: str, limit: int = 0) -> tuple[list[int], dict[int, str], bool]:
+    address_order: list[int] = []
+    logged_lookup: dict[int, str] = {}
+    truncated = False
+    for entry in parser.iter_log_entries(Path(log_path)):
+        raw_address = entry.get("address") if isinstance(entry, dict) else None
+        if not raw_address:
+            continue
+        try:
+            address = int(raw_address, 16)
+        except ValueError:
+            continue
+        if address in logged_lookup:
+            continue
+        address_order.append(address)
+        instruction = entry.get("instruction", "") if isinstance(entry, dict) else ""
+        logged_lookup[address] = instruction.strip()
+        if limit and len(address_order) >= limit:
+            truncated = True
+            break
+    return address_order, logged_lookup, truncated
+
+
+class OffsetRecalcWorker(QObject):
+    finished = Signal(object)
+    failed = Signal(str)
+    progress = Signal(int, int)
+
+    def __init__(
+        self,
+        *,
+        raw_rows: list[tuple[int, str, str]],
+        segments: list[tuple[int, int]],
+        offset: int,
+        raw_addresses: list[int],
+        sorted_values: list[int],
+        sorted_pairs: list[tuple[int, int]],
+    ) -> None:
+        super().__init__()
+        self._raw_rows = list(raw_rows)
+        self._segments = list(segments)
+        self._offset = offset
+        self._raw_addresses = list(raw_addresses)
+        self._sorted_values = list(sorted_values)
+        self._sorted_pairs = list(sorted_pairs)
+
+    def run(self) -> None:
+        try:
+            total = len(self._raw_rows)
+            self.progress.emit(0, total)
+            rows: list[tuple[int, str, str]] = []
+            progress_interval = max(total // 200, 1) if total else 1
+            for idx, (addr, binary_text, logged_text) in enumerate(self._raw_rows):
+                rows.append((addr + self._offset, binary_text, logged_text))
+                processed = idx + 1
+                if processed % progress_interval == 0 or processed == total:
+                    self.progress.emit(processed, total)
+            match_rows = sum(
+                1 for row in rows if InstructionPreviewDialog._row_state(row) == "match"
+            )
+            sections = InstructionPreviewDialog._build_sections(
+                rows,
+                self._segments,
+                offset=self._offset,
+                raw_addresses=self._raw_addresses,
+                sorted_values=self._sorted_values,
+                sorted_pairs=self._sorted_pairs,
+            )
+            self.finished.emit(
+                {
+                    "rows": rows,
+                    "match_rows": match_rows,
+                    "sections": sections,
+                }
+            )
+        except Exception as exc:  # pragma: no cover - background thread
+            self.failed.emit(str(exc))
 
 
 class BuildWorker(QObject):
@@ -276,6 +940,7 @@ class BuildProgressDialog(QDialog):
         layout.addWidget(self.output_view)
         layout.addWidget(self.progress_bar)
         layout.addWidget(self.buttons)
+        self.resize(720, 500)
 
     def append_output(self, text: str) -> None:
         self.output_view.appendPlainText(text)
@@ -318,6 +983,7 @@ class SanitizeProgressDialog(QDialog):
         layout.addWidget(self.output_view)
         layout.addWidget(self.progress_bar)
         layout.addWidget(self.buttons)
+        self.resize(720, 500)
 
     def append_output(self, text: str) -> None:
         self.output_view.appendPlainText(text)
@@ -389,6 +1055,7 @@ class SanitizeConfigDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+        self.resize(560, 380)
 
     def _apply_default_permissions(self, mode: int) -> None:
         self.read_checkbox.setChecked(bool(mode & stat.S_IRUSR))
@@ -417,6 +1084,1295 @@ class SanitizeConfigDialog(QDialog):
         return mask
 
 
+class _BinaryInstructionResolver:
+    def __init__(self, binary_path: Path) -> None:
+        self._path = Path(binary_path)
+        self._binary: lief.Binary | None = None
+        self._disassembler: capstone.Cs | None = None
+        self._sanitizer = BinarySanitizer()
+        self._cache: dict[int, str | None] = {}
+        self._error: str | None = None
+
+    def resolve(self, address: int) -> str | None:
+        if address in self._cache:
+            return self._cache[address]
+        result = self._read_instruction(address)
+        self._cache[address] = result
+        return result
+
+    def _read_instruction(self, address: int) -> str | None:
+        if address < 0:
+            return None
+        if not self._ensure_ready():
+            return None
+        assert self._binary is not None
+        assert self._disassembler is not None
+        try:
+            raw = self._binary.get_content_from_virtual_address(address, 16)
+        except Exception:
+            return None
+        data = bytes(raw)
+        if not data:
+            return None
+        instruction = next(self._disassembler.disasm(data, address), None)
+        if instruction is None:
+            return None
+        text = f"{instruction.mnemonic} {instruction.op_str}".strip()
+        return text or None
+
+    def _ensure_ready(self) -> bool:
+        if self._binary is not None and self._disassembler is not None:
+            return True
+        if self._error:
+            return False
+        try:
+            binary = lief.parse(str(self._path))
+            arch, mode, _ = self._sanitizer._capstone_config(binary)
+            disassembler = capstone.Cs(arch, mode)
+            disassembler.detail = False
+        except Exception as exc:
+            self._error = str(exc)
+            return False
+        self._binary = binary
+        self._disassembler = disassembler
+        return True
+
+
+class InstructionPreviewDialog(QDialog):
+    def __init__(
+        self,
+        parent: QWidget,
+        entry_label: str,
+        rows: list[tuple[int, str, str]],
+        segments: list[tuple[int, int]] | None = None,
+        binary_path: Path | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"Sanitization Preview — {entry_label}")
+        self._segments = list(segments or [])
+        self._raw_rows = list(rows)
+        self._binary_path = Path(binary_path) if binary_path else None
+        self._binary_instruction_resolver = (
+            _BinaryInstructionResolver(self._binary_path)
+            if self._binary_path is not None
+            else None
+        )
+        self._raw_addresses = [addr for addr, _, _ in self._raw_rows]
+        self._sorted_row_addresses = sorted((addr, idx) for idx, addr in enumerate(self._raw_addresses))
+        self._sorted_address_values = [addr for addr, _ in self._sorted_row_addresses]
+        self._binary_offset = 0
+        self._rows = list(self._raw_rows)
+        self._total_rows = len(self._rows)
+        self._match_rows = 0
+        self._sections: list[dict[str, object]] = []
+        self._resolve_binary_rows()
+        self._recompute_sections()
+        self._current_section_index: int | None = None
+        self._offset_thread: QThread | None = None
+        self._offset_worker: OffsetRecalcWorker | None = None
+        self._offset_progress_dialog: QProgressDialog | None = None
+
+        layout = QVBoxLayout(self)
+
+        description = QLabel(
+            "Start with the overview to compare binary and trace address ranges. Click a section to inspect the"
+            " underlying instructions.",
+            self,
+        )
+        description.setWordWrap(True)
+        layout.addWidget(description)
+
+        nav_bar = QHBoxLayout()
+        self.view_label = QLabel("Overview", self)
+        nav_bar.addWidget(self.view_label)
+        self.offset_label = QLabel("Binary offset: +0x0", self)
+        self.offset_label.setStyleSheet("color: #666; font-size: 11px;")
+        nav_bar.addWidget(self.offset_label)
+        nav_bar.addStretch(1)
+        self.analyze_button = QPushButton("Analyze Adjust Offset", self)
+        self.analyze_button.clicked.connect(self._open_sequence_analyzer)
+        nav_bar.addWidget(self.analyze_button)
+        self.adjust_offset_button = QPushButton("Manual Adjust Offset", self)
+        self.adjust_offset_button.clicked.connect(self._prompt_binary_offset)
+        nav_bar.addWidget(self.adjust_offset_button)
+        self.zoom_out_button = QPushButton("Zoom Out", self)
+        self.zoom_out_button.clicked.connect(self._show_overview)
+        self.zoom_out_button.hide()
+        nav_bar.addWidget(self.zoom_out_button)
+        layout.addLayout(nav_bar)
+
+        self.stack = QStackedWidget(self)
+        self.overview_widget = self._build_overview_widget()
+        self.detail_widget = self._build_detail_widget()
+        self.stack.addWidget(self.overview_widget)
+        self.stack.addWidget(self.detail_widget)
+        layout.addWidget(self.stack)
+
+        self.progress_bar = QProgressBar(self)
+        self.progress_bar.setTextVisible(True)
+        layout.addWidget(self.progress_bar)
+        self._update_progress_bar()
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Close, self)
+        self.copy_button = buttons.addButton("Copy Selection", QDialogButtonBox.ActionRole)
+        self.copy_button.clicked.connect(self._copy_selected_rows)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self._populate_overview_table()
+        self._update_offset_label()
+        self._show_overview()
+        _resize_widget_to_screen(self)
+
+    @staticmethod
+    def _monospace_font(font):
+        adjusted = QFont(font)
+        # Prefer a monospace face while falling back gracefully on the system default.
+        adjusted.setFamilies(["Monospace", "Courier New", adjusted.defaultFamily()])
+        adjusted.setStyleHint(QFont.StyleHint.Monospace)
+        return adjusted
+
+    def _build_overview_widget(self) -> QWidget:
+        widget = QWidget(self)
+        layout = QVBoxLayout(widget)
+        table = QTableWidget(0, 4, widget)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SingleSelection)
+        table.verticalHeader().setVisible(False)
+        table.setHorizontalHeaderLabels(["Section", "Binary Range", "Trace Range", "Status"])
+        header = table.horizontalHeader()
+        header.setStretchLastSection(True)
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.Stretch)
+
+        table.cellDoubleClicked.connect(self._handle_overview_activation)
+        layout.addWidget(table)
+        self.overview_table = table
+        empty_label = QLabel("No instruction samples were found in the trace for preview.", widget)
+        empty_label.setWordWrap(True)
+        empty_label.hide()
+        layout.addWidget(empty_label)
+        self.no_sections_label = empty_label
+        return widget
+
+    def _populate_overview_table(
+        self,
+        *,
+        progress_callback: Callable[[str], None] | None = None,
+        done_callback: Callable[[], None] | None = None,
+    ) -> None:
+        table = getattr(self, "overview_table", None)
+        if table is None:
+            return
+        sections = list(self._sections)
+        table.setRowCount(len(sections))
+        if hasattr(self, "no_sections_label"):
+            has_sections = len(sections) > 0
+            self.no_sections_label.setVisible(not has_sections)
+            table.setVisible(has_sections)
+        if not sections:
+            table.clearContents()
+            if done_callback:
+                QTimer.singleShot(0, done_callback)
+            return
+
+        def _finish() -> None:
+            self._finalize_overview_selection()
+            if progress_callback and sections:
+                total = len(sections)
+                progress_callback(f"Overview rows ready ({total}/{total})")
+            if done_callback:
+                done_callback()
+
+        if done_callback is None:
+            for row_idx, section in enumerate(sections):
+                self._set_overview_row(row_idx, section)
+            _finish()
+            return
+
+        total = len(sections)
+        chunk = max(total // 20, 20) if total else 1
+
+        def _process(start: int = 0) -> None:
+            end = min(start + chunk, total)
+            for row_idx in range(start, end):
+                self._set_overview_row(row_idx, sections[row_idx])
+            if progress_callback:
+                progress_callback(f"Populating overview rows ({end}/{total})")
+            if end < total:
+                QTimer.singleShot(0, lambda: _process(end))
+            else:
+                _finish()
+
+        _process(0)
+
+    def _set_overview_row(self, row_idx: int, section: dict[str, object]) -> None:
+        table = getattr(self, "overview_table", None)
+        if table is None:
+            return
+        label_text = section.get("label") or str(row_idx + 1)
+        section_item = QTableWidgetItem(label_text)
+        binary_range_item = QTableWidgetItem(self._format_range(section, key="binary"))
+        trace_range_item = QTableWidgetItem(self._format_range(section, key="trace"))
+        status_item = QTableWidgetItem(self._section_label(section["state"]))
+        for item in (section_item, binary_range_item, trace_range_item, status_item):
+            self._apply_section_color(item, section["state"])
+        table.setItem(row_idx, 0, section_item)
+        table.setItem(row_idx, 1, binary_range_item)
+        table.setItem(row_idx, 2, trace_range_item)
+        table.setItem(row_idx, 3, status_item)
+
+    def _finalize_overview_selection(self) -> None:
+        table = getattr(self, "overview_table", None)
+        if table is None:
+            return
+        sections = list(self._sections)
+        if self._current_section_index is not None and self._current_section_index < len(sections):
+            table.selectRow(self._current_section_index)
+        else:
+            table.clearSelection()
+
+    def _build_detail_widget(self) -> QWidget:
+        widget = QWidget(self)
+        layout = QVBoxLayout(widget)
+        table = QTableWidget(0, 3, widget)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        table.verticalHeader().setVisible(False)
+        table.setHorizontalHeaderLabels(["Address", "Binary Instruction", "Logged Instruction"])
+        header = table.horizontalHeader()
+        header.setStretchLastSection(True)
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        layout.addWidget(table)
+        self.detail_table = table
+        return widget
+
+    @staticmethod
+    def _build_sections(
+        rows: list[tuple[int, str, str]],
+        segments: list[tuple[int, int]] | None = None,
+        *,
+        offset: int = 0,
+        raw_addresses: list[int] | None = None,
+        sorted_values: list[int] | None = None,
+        sorted_pairs: list[tuple[int, int]] | None = None,
+    ) -> list[dict[str, object]]:
+        if segments:
+            return InstructionPreviewDialog._build_segment_sections(
+                rows,
+                segments,
+                offset=offset,
+                raw_addresses=raw_addresses or [],
+                sorted_values=sorted_values or [],
+                sorted_pairs=sorted_pairs or [],
+            )
+        if not rows:
+            return []
+        sections: list[dict[str, object]] = []
+        start = 0
+        current_state = InstructionPreviewDialog._row_state(rows[0])
+        for idx in range(1, len(rows)):
+            state = InstructionPreviewDialog._row_state(rows[idx])
+            if state != current_state:
+                sections.append(InstructionPreviewDialog._make_section(rows, start, idx, current_state))
+                start = idx
+                current_state = state
+        sections.append(InstructionPreviewDialog._make_section(rows, start, len(rows), current_state))
+        return sections
+
+    @staticmethod
+    def _build_segment_sections(
+        rows: list[tuple[int, str, str]],
+        segments: list[tuple[int, int]],
+        *,
+        offset: int,
+        raw_addresses: list[int],
+        sorted_values: list[int],
+        sorted_pairs: list[tuple[int, int]],
+    ) -> list[dict[str, object]]:
+        sections: list[dict[str, object]] = []
+        if not segments:
+            return sections
+        total_rows = len(rows)
+        for seg_index, (seg_start, seg_end) in enumerate(segments):
+            lo = bisect_left(sorted_values, seg_start)
+            hi = bisect_right(sorted_values, seg_end)
+            idxs = [sorted_pairs[i][1] for i in range(lo, hi)] if hi > lo else []
+            if idxs:
+                start_idx = min(idxs)
+                end_idx = max(idxs) + 1
+                subset = rows[start_idx:end_idx]
+                trace_start = min(raw_addresses[i] for i in idxs)
+                trace_end = max(raw_addresses[i] for i in idxs)
+            else:
+                start_idx = total_rows
+                end_idx = total_rows
+                subset = []
+                trace_start = seg_start
+                trace_end = seg_end
+            state = InstructionPreviewDialog._section_state_for_subset(subset)
+            sections.append(
+                {
+                    "start": start_idx,
+                    "end": end_idx,
+                    "state": state,
+                    "binary_start": seg_start + offset,
+                    "binary_end": seg_end + offset,
+                    "trace_start": trace_start,
+                    "trace_end": trace_end,
+                    "segment_index": seg_index,
+                    "label": f"Segment {seg_index + 1}",
+                }
+            )
+        return sections
+
+    @staticmethod
+    def _section_state_for_subset(subset: list[tuple[int, str, str]]) -> str:
+        if not subset:
+            return "missing"
+        states = {InstructionPreviewDialog._row_state(row) for row in subset}
+        if len(states) == 1:
+            return states.pop()
+        return "mismatch"
+
+    @staticmethod
+    def _row_state(row: tuple[int, str, str]) -> str:
+        _, binary_text, logged_text = row
+        binary_clean = (binary_text or "").strip()
+        logged_clean = (logged_text or "").strip()
+        if not binary_clean or binary_clean.startswith("<"):
+            return "missing"
+        if not logged_clean:
+            return "missing"
+        return "match" if binary_clean.lower() == logged_clean.lower() else "mismatch"
+
+    @staticmethod
+    def _make_section(
+        rows: list[tuple[int, str, str]],
+        start: int,
+        end: int,
+        state: str,
+    ) -> dict[str, object]:
+        start_addr = rows[start][0]
+        end_addr = rows[end - 1][0] if end - 1 >= start else start_addr
+        return {
+            "start": start,
+            "end": end,
+            "state": state,
+            "binary_start": start_addr,
+            "binary_end": end_addr,
+            "trace_start": start_addr,
+            "trace_end": end_addr,
+        }
+
+    def _section_label(self, state: str) -> str:
+        return {
+            "match": "Binary and trace match",
+            "mismatch": "Differences detected",
+            "missing": "Instruction unavailable",
+        }.get(state, "Unknown")
+
+    def _apply_section_color(self, item: QTableWidgetItem, state: str) -> None:
+        colors = {
+            "match": QColor("#c8e6c9"),
+            "mismatch": QColor("#ffcdd2"),
+            "missing": QColor("#ffe0b2"),
+        }
+        color = colors.get(state)
+        if color:
+            item.setBackground(color)
+
+    def _format_range(self, section: dict[str, object], key: str = "binary") -> str:
+        start_addr = section.get(f"{key}_start", 0)
+        end_addr = section.get(f"{key}_end", 0)
+        return f"0x{int(start_addr):x} – 0x{int(end_addr):x}"
+
+    def _handle_overview_activation(self, row: int, _column: int) -> None:
+        self._show_section(row)
+
+    def _show_section(
+        self,
+        index: int,
+        *,
+        progress_callback: Callable[[str], None] | None = None,
+        done_callback: Callable[[], None] | None = None,
+    ) -> None:
+        if index < 0 or index >= len(self._sections):
+            return
+        section = self._sections[index]
+        subset = self._rows[int(section["start"]): int(section["end"])]
+        label_text = section.get("label") or f"Section {index + 1}"
+        self.view_label.setText(f"{label_text}: {self._format_range(section)}")
+        self.zoom_out_button.show()
+        self.stack.setCurrentWidget(self.detail_widget)
+        self._current_section_index = index
+        self._update_copy_button_state()
+        if done_callback is None:
+            self._populate_detail_table(subset, progress_callback=progress_callback)
+            return
+
+        def _finish_section() -> None:
+            if done_callback:
+                done_callback()
+
+        self._populate_detail_table(
+            subset,
+            progress_callback=progress_callback,
+            done_callback=_finish_section,
+        )
+
+    def _finalize_overview_selection(self) -> None:
+        table = getattr(self, "overview_table", None)
+        if table is None:
+            return
+        sections = list(self._sections)
+        if self._current_section_index is not None and self._current_section_index < len(sections):
+            table.selectRow(self._current_section_index)
+        else:
+            table.clearSelection()
+
+    def _update_progress_bar(self) -> None:
+        total = max(1, self._total_rows)
+        value = min(self._match_rows, total)
+        self.progress_bar.setRange(0, total)
+        self.progress_bar.setValue(value)
+        percentage = (value / total) * 100 if total else 0
+        self.progress_bar.setFormat(f"Matching instructions: {value}/{total} ({percentage:.1f}%)")
+
+    def _prompt_binary_offset(self) -> None:
+        default_text = self._format_offset(self._binary_offset)
+        text, ok = QInputDialog.getText(
+            self,
+            "Adjust Binary Offset",
+            "Enter the offset applied to binary addresses (hex values may use 0x prefix):",
+            text=default_text,
+        )
+        if not ok:
+            return
+        value = self._parse_offset_input(text)
+        if value is None:
+            QMessageBox.warning(self, "Invalid offset", "Please enter a valid decimal or hexadecimal integer.")
+            return
+        self._apply_binary_offset(value)
+
+    def _open_sequence_analyzer(self) -> None:
+        if not self._raw_rows:
+            QMessageBox.information(self, "No data", "Load a preview before analyzing sequences.")
+            return
+        dialog = SequenceAnalyzerDialog(
+            self,
+            self._raw_rows,
+            binary_offset=self._binary_offset,
+            binary_path=self._binary_path,
+        )
+        selected_offset: dict[str, int | None] = {"value": None}
+
+        def _remember_offset(value: object) -> None:
+            if selected_offset["value"] is not None:
+                return
+            try:
+                numeric = int(value)
+            except Exception:
+                return
+            selected_offset["value"] = numeric
+            self._show_pending_offset_dialog(numeric)
+
+        dialog.offset_selected.connect(_remember_offset)
+        dialog.exec()
+        if selected_offset["value"] is not None:
+            self._apply_binary_offset(selected_offset["value"] or 0)
+
+    def _show_pending_offset_dialog(self, offset_value: int) -> None:
+        total_rows = len(self._raw_rows)
+        label = (
+            f"Applying offset {self._format_offset(offset_value)} (0/{total_rows})"
+            if total_rows
+            else "Applying offset (no rows)"
+        )
+        self._ensure_offset_progress_dialog(total_rows, label)
+
+    def _ensure_offset_progress_dialog(self, total_rows: int, label: str) -> QProgressDialog:
+        max_value = max(total_rows, 1)
+        self.raise_()
+        self.activateWindow()
+        dialog = self._offset_progress_dialog
+        if dialog is None:
+            dialog = QProgressDialog("Applying binary offset...", None, 0, max_value, self)
+            dialog.setWindowTitle("Applying Binary Offset")
+            dialog.setWindowModality(Qt.WindowModal)
+            dialog.setCancelButton(None)
+            dialog.setMinimumDuration(0)
+            dialog.setAutoClose(False)
+            dialog.setAutoReset(False)
+            dialog.resize(520, 200)
+            self._offset_progress_dialog = dialog
+        dialog.setRange(0, max_value)
+        dialog.setValue(0)
+        dialog.setLabelText(label)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        QApplication.processEvents()
+        return dialog
+
+    def _update_offset_progress_label(self, text: str) -> None:
+        dialog = self._offset_progress_dialog
+        if not dialog:
+            return
+        dialog.setLabelText(text)
+        QApplication.processEvents()
+
+    def _parse_offset_input(self, raw: str | None) -> int | None:
+        if raw is None:
+            return None
+        text = raw.strip()
+        if not text:
+            return 0
+        try:
+            return int(text, 0)
+        except ValueError:
+            return None
+
+    def _apply_binary_offset(self, offset: int) -> None:
+        if offset == self._binary_offset:
+            return
+        if getattr(self, "_offset_thread", None):
+            return
+        if hasattr(self, "adjust_offset_button"):
+            self.adjust_offset_button.setEnabled(False)
+        total_rows = len(self._raw_rows)
+        label = (
+            f"Updating preview (0/{total_rows})"
+            if total_rows
+            else "Updating preview (no rows)"
+        )
+        self._ensure_offset_progress_dialog(total_rows, label)
+
+        worker = OffsetRecalcWorker(
+            raw_rows=self._raw_rows,
+            segments=self._segments,
+            offset=offset,
+            raw_addresses=self._raw_addresses,
+            sorted_values=self._sorted_address_values,
+            sorted_pairs=self._sorted_row_addresses,
+        )
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        self._offset_worker = worker
+        self._offset_thread = thread
+
+        def _cleanup() -> None:
+            if hasattr(self, "adjust_offset_button"):
+                self.adjust_offset_button.setEnabled(True)
+            if self._offset_progress_dialog:
+                self._offset_progress_dialog.close()
+                self._offset_progress_dialog.deleteLater()
+                self._offset_progress_dialog = None
+            if self._offset_thread:
+                self._offset_thread.quit()
+                self._offset_thread.wait()
+                self._offset_thread.deleteLater()
+                self._offset_thread = None
+            if self._offset_worker:
+                self._offset_worker.deleteLater()
+                self._offset_worker = None
+
+        def _handle_finished(payload: dict[str, object]) -> None:
+            progress_dialog = self._offset_progress_dialog
+            if progress_dialog:
+                progress_dialog.setRange(0, 0)
+                progress_dialog.setLabelText("Finalizing preview...")
+                QApplication.processEvents()
+
+            steps: deque[tuple[str, bool, Callable[..., None]]] = deque()
+
+            def enqueue(
+                label: str,
+                func: Callable[[], None] | Callable[[Callable[[], None]], None],
+                *,
+                async_step: bool = False,
+            ) -> None:
+                steps.append((label, async_step, func))
+
+            enqueue("Applying new rows...", lambda: self._assign_offset_payload(payload, offset))
+            enqueue(
+                "Refreshing overview table...",
+                lambda done: self._populate_overview_table(
+                    progress_callback=self._update_offset_progress_label,
+                    done_callback=done,
+                ),
+                async_step=True,
+            )
+            if (
+                self._current_section_index is not None
+                and self._current_section_index < len(self._sections)
+            ):
+                enqueue(
+                    "Refreshing section view...",
+                    lambda done: self._show_section(
+                        self._current_section_index,
+                        progress_callback=self._update_offset_progress_label,
+                        done_callback=done,
+                    ),
+                    async_step=True,
+                )
+            else:
+                enqueue("Showing overview...", self._show_overview)
+            enqueue("Updating summary widgets...", self._update_progress_bar)
+            enqueue("Updating offset label...", self._update_offset_label)
+
+            steps_total = len(steps)
+
+            def _run_next_step() -> None:
+                if not steps:
+                    _cleanup()
+                    return
+                progress_dialog = self._offset_progress_dialog
+                completed = steps_total - len(steps)
+                label, async_step, func = steps.popleft()
+                if progress_dialog:
+                    suffix = f" ({completed + 1}/{steps_total})" if steps_total else ""
+                    progress_dialog.setLabelText(f"{label}{suffix}")
+                    QApplication.processEvents()
+
+                def _continue() -> None:
+                    QApplication.processEvents()
+                    QTimer.singleShot(0, _run_next_step)
+
+                if async_step:
+                    func(_continue)
+                else:
+                    func()
+                    _continue()
+
+            QTimer.singleShot(0, _run_next_step)
+
+        def _handle_failed(message: str) -> None:
+            QMessageBox.warning(self, "Offset update failed", message)
+            _cleanup()
+
+        def _handle_progress(processed: int, total: int) -> None:
+            current_total = total if total else total_rows
+            current_total = max(current_total, 1)
+            clamped = max(0, min(processed, current_total))
+            progress_dialog = self._offset_progress_dialog
+            if not progress_dialog:
+                return
+            progress_dialog.setMaximum(current_total)
+            progress_dialog.setValue(clamped)
+            if total_rows:
+                if clamped >= current_total:
+                    self._update_offset_progress_label("Update complete. Finalizing preview...")
+                else:
+                    self._update_offset_progress_label(f"Updating preview ({clamped}/{current_total})")
+            else:
+                self._update_offset_progress_label("Updating preview...")
+
+        worker.progress.connect(_handle_progress)
+        worker.finished.connect(_handle_finished)
+        worker.failed.connect(_handle_failed)
+        thread.started.connect(worker.run)
+        thread.start()
+
+    def _assign_offset_payload(self, payload: dict[str, object], offset: int) -> None:
+        self._binary_offset = offset
+        self._rows = list(payload.get("rows", []))
+        self._total_rows = len(self._rows)
+        self._match_rows = 0
+        self._sections = []
+        self._resolve_binary_rows()
+        self._recompute_sections()
+
+    def _update_offset_label(self) -> None:
+        if hasattr(self, "offset_label"):
+            self.offset_label.setText(f"Binary offset: {self._format_offset(self._binary_offset)}")
+
+    @staticmethod
+    def _format_offset(value: int) -> str:
+        return f"{value:+#x}"
+
+    def _resolve_binary_rows(self) -> None:
+        resolver = getattr(self, "_binary_instruction_resolver", None)
+        if resolver is None:
+            return
+        updated: list[tuple[int, str, str]] = []
+        for address, binary_text, logged_text in self._rows:
+            resolved = self._detail_binary_text(address, binary_text)
+            updated.append((address, resolved, logged_text))
+        self._rows = updated
+
+    def _recompute_sections(self) -> None:
+        self._match_rows = sum(1 for row in self._rows if self._row_state(row) == "match")
+        self._sections = self._build_sections(
+            self._rows,
+            self._segments,
+            offset=self._binary_offset,
+            raw_addresses=self._raw_addresses,
+            sorted_values=self._sorted_address_values,
+            sorted_pairs=self._sorted_row_addresses,
+        )
+
+    def _populate_detail_table(
+        self,
+        rows: list[tuple[int, str, str]],
+        *,
+        progress_callback: Callable[[str], None] | None = None,
+        done_callback: Callable[[], None] | None = None,
+    ) -> None:
+        table = getattr(self, "detail_table", None)
+        if table is None:
+            if done_callback:
+                done_callback()
+            return
+        total_rows = len(rows)
+        table.clearContents()
+        table.setRowCount(total_rows)
+        if total_rows == 0:
+            table.resizeRowsToContents()
+            if progress_callback:
+                progress_callback("No detail rows to populate.")
+            if done_callback:
+                done_callback()
+            return
+
+        chunk = max(total_rows // 50, 50) if total_rows else 1
+
+        def _process_range(start: int, end: int) -> None:
+            for row_idx in range(start, end):
+                address, binary_text, logged_text = rows[row_idx]
+                self._set_detail_row(row_idx, address, binary_text, logged_text)
+
+        def _finalize_rows() -> None:
+            table.resizeRowsToContents()
+            if progress_callback:
+                progress_callback(f"Detail rows ready ({total_rows}/{total_rows})")
+            if done_callback:
+                done_callback()
+
+        if done_callback is None:
+            for start in range(0, total_rows, chunk):
+                end = min(start + chunk, total_rows)
+                _process_range(start, end)
+                if progress_callback:
+                    progress_callback(f"Populating detail rows ({end}/{total_rows})")
+            _finalize_rows()
+            return
+
+        def _process_async(start: int = 0) -> None:
+            end = min(start + chunk, total_rows)
+            _process_range(start, end)
+            if progress_callback:
+                progress_callback(f"Populating detail rows ({end}/{total_rows})")
+            if end < total_rows:
+                QTimer.singleShot(0, lambda: _process_async(end))
+            else:
+                _finalize_rows()
+
+        _process_async(0)
+
+    def _detail_binary_text(self, address: int, stored_text: str | None) -> str:
+        looked_up = self._lookup_binary_instruction(address)
+        if looked_up:
+            return looked_up
+        cleaned = (stored_text or "").strip()
+        return cleaned or "<unavailable>"
+
+    def _lookup_binary_instruction(self, adjusted_address: int) -> str | None:
+        resolver = getattr(self, "_binary_instruction_resolver", None)
+        if resolver is None:
+            return None
+        if self._binary_offset:
+            binary_address = adjusted_address - (2 * self._binary_offset)
+        else:
+            binary_address = adjusted_address
+        if binary_address < 0:
+            return None
+        return resolver.resolve(binary_address)
+
+    def _set_detail_row(
+        self,
+        row_idx: int,
+        address: int,
+        binary_text: str | None,
+        logged_text: str | None,
+    ) -> None:
+        table = getattr(self, "detail_table", None)
+        if table is None:
+            return
+        addr_item = QTableWidgetItem(f"0x{address:x}")
+        addr_item.setFont(self._monospace_font(addr_item.font()))
+        table.setItem(row_idx, 0, addr_item)
+        resolved_binary = self._detail_binary_text(address, binary_text)
+        table.setItem(row_idx, 1, QTableWidgetItem(resolved_binary))
+        table.setItem(row_idx, 2, QTableWidgetItem(logged_text or ""))
+        state = self._row_state((address, resolved_binary, logged_text))
+        self._apply_section_color(addr_item, state)
+        self._apply_section_color(table.item(row_idx, 1), state)
+        self._apply_section_color(table.item(row_idx, 2), state)
+
+    def _show_overview(self) -> None:
+        if hasattr(self, "stack"):
+            self.stack.setCurrentWidget(self.overview_widget)
+        self.view_label.setText("Overview")
+        self.zoom_out_button.hide()
+        self._current_section_index = None
+        self._update_copy_button_state()
+
+    def _copy_selected_rows(self) -> None:
+        if self.stack.currentWidget() != self.detail_widget:
+            QApplication.clipboard().setText("")
+            return
+        table = self.detail_table
+        selection = table.selectionModel()
+        if selection is None or not selection.hasSelection():
+            QApplication.clipboard().setText("")
+            return
+        rows = sorted({index.row() for index in selection.selectedIndexes()})
+        parts: list[str] = []
+        for row in rows:
+            address = table.item(row, 0).text() if table.item(row, 0) else ""
+            binary_text = table.item(row, 1).text() if table.item(row, 1) else ""
+            logged_text = table.item(row, 2).text() if table.item(row, 2) else ""
+            parts.append(f"{address}\t{binary_text}\t{logged_text}")
+        QApplication.clipboard().setText("\n".join(parts))
+
+    def _update_copy_button_state(self) -> None:
+        if hasattr(self, "copy_button"):
+            self.copy_button.setEnabled(self.stack.currentWidget() == self.detail_widget)
+
+
+class SequenceAnalyzerDialog(QDialog):
+    offset_selected = Signal(object)
+
+    def __init__(
+        self,
+        parent: QWidget,
+        rows: list[tuple[int, str, str]],
+        *,
+        binary_offset: int = 0,
+        binary_path: Path | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Instruction Sequence Analyzer")
+        self._trace_rows = list(rows)
+        self._binary_offset = binary_offset
+        self._binary_path = Path(binary_path) if binary_path else None
+        self._binary_rows = self._build_binary_rows()
+        self._trace_norm = [self._normalize_instruction(row[2]) for row in self._trace_rows]
+        self._find_thread: QThread | None = None
+        self._find_worker: SequenceAnalyzerFindWorker | None = None
+        self._find_progress_dialog: QProgressDialog | None = None
+        self._find_total_positions = 0
+        self._matches: list[dict[str, object]] = []
+
+        layout = QVBoxLayout(self)
+        description = QLabel(
+            "Select sequential binary instructions, then search the trace for the same sequence to infer the offset.",
+            self,
+        )
+        description.setWordWrap(True)
+        layout.addWidget(description)
+
+        content_row = QHBoxLayout()
+        layout.addLayout(content_row)
+
+        left_panel = QVBoxLayout()
+        binary_label = QLabel("Binary Instructions", self)
+        binary_label.setStyleSheet("font-weight: bold;")
+        left_panel.addWidget(binary_label)
+        search_row = QHBoxLayout()
+        self.binary_filter_input = QLineEdit(self)
+        self.binary_filter_input.setPlaceholderText("Search addresses or instructions...")
+        self.binary_filter_input.setClearButtonEnabled(True)
+        self.binary_filter_input.textChanged.connect(self._apply_binary_filter)
+        search_row.addWidget(self.binary_filter_input)
+        left_panel.addLayout(search_row)
+        self.binary_table = QTableWidget(len(self._binary_rows), 3, self)
+        self.binary_table.setHorizontalHeaderLabels(["#", "Binary Address", "Binary Instruction"])
+        self.binary_table.verticalHeader().setVisible(False)
+        self.binary_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.binary_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        header = self.binary_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.Stretch)
+        self._populate_binary_table()
+        selection_model = self.binary_table.selectionModel()
+        if selection_model:
+            selection_model.selectionChanged.connect(self._update_find_button_state)
+        left_panel.addWidget(self.binary_table)
+
+        self.find_button = QPushButton("Find in Trace", self)
+        self.find_button.setEnabled(False)
+        self.find_button.clicked.connect(self._handle_find_sequence)
+        left_panel.addWidget(self.find_button)
+        content_row.addLayout(left_panel, 2)
+
+        right_panel = QVBoxLayout()
+        matches_label = QLabel("Trace Matches", self)
+        matches_label.setStyleSheet("font-weight: bold;")
+        right_panel.addWidget(matches_label)
+        self.results_table = QTableWidget(0, 3, self)
+        self.results_table.setHorizontalHeaderLabels(["Trace Start", "Offset", "Preview"])
+        self.results_table.verticalHeader().setVisible(False)
+        self.results_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.results_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        results_header = self.results_table.horizontalHeader()
+        results_header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        results_header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        results_header.setSectionResizeMode(2, QHeaderView.Stretch)
+        right_panel.addWidget(self.results_table)
+        self.set_offset_button = QPushButton("Set Binary Offset", self)
+        self.set_offset_button.setEnabled(False)
+        self.set_offset_button.clicked.connect(self._handle_set_offset_clicked)
+        right_panel.addWidget(self.set_offset_button)
+        self.results_status = QLabel("Select instructions to begin.", self)
+        self.results_status.setStyleSheet("color: #666;")
+        right_panel.addWidget(self.results_status)
+        content_row.addLayout(right_panel, 3)
+
+        self.results_table.itemSelectionChanged.connect(self._update_set_offset_button_state)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Close, self)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        if not self._binary_rows:
+            self.results_status.setText(
+                "No binary instructions were resolved for this preview. Adjust the binary offset and reopen Analyze."
+            )
+            self.find_button.setEnabled(False)
+
+        _resize_widget_to_screen(self)
+
+    def _build_binary_rows(self) -> list[dict[str, object]]:
+        rows = self._load_binary_instructions_from_binary()
+        if rows:
+            return rows
+        return self._build_rows_from_trace_preview()
+
+    def _load_binary_instructions_from_binary(self) -> list[dict[str, object]]:
+        if not self._binary_path:
+            return []
+        try:
+            binary = lief.parse(str(self._binary_path))
+        except Exception:
+            return []
+        sanitizer = BinarySanitizer()
+        try:
+            arch, mode, _ = sanitizer._capstone_config(binary)
+        except Exception:
+            return []
+        import capstone  # defer heavy import until needed
+
+        md = capstone.Cs(arch, mode)
+        md.detail = False
+        rows: list[dict[str, object]] = []
+        remaining = SEQUENCE_ANALYZER_MAX_BINARY_INSTRUCTIONS
+        for section in sanitizer._executable_sections(binary):
+            data = bytes(section.content)
+            if not data:
+                continue
+            for instruction in md.disasm(data, section.virtual_address):
+                text = f"{instruction.mnemonic} {instruction.op_str}".strip()
+                if not self._has_binary_instruction(text):
+                    continue
+                raw_addr = int(instruction.address)
+                rows.append({
+                    "raw": raw_addr,
+                    "display": raw_addr + self._binary_offset,
+                    "text": text,
+                })
+                remaining -= 1
+                if remaining <= 0:
+                    rows.sort(key=lambda row: row["raw"])
+                    return rows
+        rows.sort(key=lambda row: row["raw"])
+        return rows
+
+    def _build_rows_from_trace_preview(self) -> list[dict[str, object]]:
+        if not self._trace_rows:
+            return []
+        rows: list[dict[str, object]] = []
+        for addr, binary_text, _logged in self._trace_rows:
+            if not self._has_binary_instruction(binary_text):
+                continue
+            raw_addr = int(addr)
+            rows.append({
+                "raw": raw_addr,
+                "display": raw_addr + self._binary_offset,
+                "text": binary_text,
+            })
+        return rows
+
+    def _populate_binary_table(self) -> None:
+        for idx, row in enumerate(self._binary_rows):
+            address = row["display"]
+            binary_text = row["text"]
+            index_item = QTableWidgetItem(str(idx + 1))
+            addr_item = QTableWidgetItem(f"0x{int(address):x}")
+            instr_item = QTableWidgetItem(binary_text or "<unavailable>")
+            for item in (index_item, addr_item, instr_item):
+                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+            self.binary_table.setItem(idx, 0, index_item)
+            self.binary_table.setItem(idx, 1, addr_item)
+            self.binary_table.setItem(idx, 2, instr_item)
+
+    def _apply_binary_filter(self, text: str) -> None:
+        table = self.binary_table
+        if table is None:
+            return
+        raw_query = (text or "").strip()
+        terms = [part.lower() for part in (segment.strip() for segment in raw_query.split("|")) if part]
+        total_rows = table.rowCount()
+        if not terms:
+            selected_rows = self._selected_binary_rows()
+            selected_row = selected_rows[0] if selected_rows else None
+            for row in range(total_rows):
+                table.setRowHidden(row, False)
+            if selected_row is not None and 0 <= selected_row < total_rows:
+                table.selectRow(selected_row)
+                target_item = table.item(selected_row, 0) or table.item(selected_row, 1)
+                if target_item:
+                    table.scrollToItem(target_item, QAbstractItemView.PositionAtCenter)
+            self._update_find_button_state()
+            return
+        for row in range(total_rows):
+            addr_item = table.item(row, 1)
+            instr_item = table.item(row, 2)
+            addr_text = (addr_item.text() if addr_item else "").lower()
+            instr_text = (instr_item.text() if instr_item else "").lower()
+            match = any(term in addr_text or term in instr_text for term in terms)
+            table.setRowHidden(row, not match)
+        table.clearSelection()
+        self._update_find_button_state()
+
+    def _update_find_button_state(self) -> None:
+        selection = self._selected_binary_rows()
+        self.find_button.setEnabled(bool(selection))
+
+    def _selected_binary_rows(self) -> list[int]:
+        selection = self.binary_table.selectionModel()
+        if selection is None:
+            return []
+        rows = sorted({index.row() for index in selection.selectedRows()})
+        return [row for row in rows if not self.binary_table.isRowHidden(row)]
+
+    def _handle_find_sequence(self) -> None:
+        if self._find_worker is not None:
+            QMessageBox.information(
+                self,
+                "Search running",
+                "A trace search is already running. Cancel it before starting a new one.",
+            )
+            return
+        rows = self._selected_binary_rows()
+        if not rows:
+            QMessageBox.information(self, "No selection", "Select sequential binary instructions to search.")
+            return
+        if not self._binary_rows:
+            QMessageBox.warning(self, "No data", "Unable to analyze without preview rows.")
+            return
+        if any(rows[idx] + 1 != rows[idx + 1] for idx in range(len(rows) - 1)):
+            QMessageBox.warning(self, "Selection not sequential", "Please select sequential rows with no gaps.")
+            return
+        if any(not self._has_binary_instruction(self._binary_rows[idx]["text"]) for idx in rows):
+            QMessageBox.warning(
+                self,
+                "Missing instructions",
+                "One or more selected rows do not have binary instructions. Adjust the binary offset or select different rows.",
+            )
+            return
+        sequence = [self._normalize_instruction(self._binary_rows[idx]["text"]) for idx in rows]
+        if not any(sequence):
+            QMessageBox.information(self, "Empty instructions", "Selected rows do not contain binary instructions.")
+            return
+        needle_len = len(sequence)
+        search_space = max(len(self._trace_norm) - needle_len + 1, 0)
+        if search_space <= 0:
+            QMessageBox.information(self, "Trace too short", "Trace does not contain enough instructions to search.")
+            return
+        self.results_status.setText("Searching trace...")
+        progress_dialog = QProgressDialog("Scanning trace...", "Cancel", 0, search_space, self)
+        progress_dialog.setWindowTitle("Searching Trace")
+        progress_dialog.setWindowModality(Qt.WindowModal)
+        progress_dialog.setMinimumDuration(0)
+        progress_dialog.setAutoClose(False)
+        progress_dialog.setAutoReset(False)
+        progress_dialog.setValue(0)
+        progress_dialog.setLabelText(f"Scanning trace (0/{search_space})")
+        progress_dialog.resize(580, 220)
+
+        worker = SequenceAnalyzerFindWorker(
+            trace_rows=self._trace_rows,
+            trace_norm=self._trace_norm,
+            binary_rows=self._binary_rows,
+            binary_start_row=rows[0],
+            sequence=sequence,
+            total_positions=search_space,
+            max_matches=SEQUENCE_ANALYZER_MAX_TRACE_MATCHES,
+        )
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        worker.progress.connect(self._update_find_progress)
+        worker.succeeded.connect(self._handle_find_succeeded)
+        worker.cancelled.connect(self._handle_find_cancelled)
+        worker.failed.connect(self._handle_find_failed)
+        thread.started.connect(worker.run)
+        progress_dialog.canceled.connect(worker.cancel)
+
+        self._find_worker = worker
+        self._find_thread = thread
+        self._find_progress_dialog = progress_dialog
+        self._find_total_positions = search_space
+        self.find_button.setEnabled(False)
+        progress_dialog.show()
+        thread.start()
+
+    def _populate_results(self, matches: list[dict[str, object]], *, truncated: bool = False) -> None:
+        table = self.results_table
+        table.setUpdatesEnabled(False)
+        try:
+            self._matches = list(matches)
+            table.clearContents()
+            table.setRowCount(len(self._matches))
+            for row_idx, match in enumerate(self._matches):
+                trace_start = int(match.get("trace_start", 0)) if isinstance(match, dict) else 0
+                offset_value = int(match.get("offset", 0)) if isinstance(match, dict) else 0
+                preview_text = str(match.get("preview", "")) if isinstance(match, dict) else ""
+                trace_item = QTableWidgetItem(f"0x{trace_start:x}")
+                offset_item = QTableWidgetItem(self._format_offset(offset_value))
+                preview_item = QTableWidgetItem(preview_text or "")
+                table.setItem(row_idx, 0, trace_item)
+                table.setItem(row_idx, 1, offset_item)
+                table.setItem(row_idx, 2, preview_item)
+        finally:
+            table.setUpdatesEnabled(True)
+        table.resizeRowsToContents()
+        if self._matches:
+            status = f"Found {len(self._matches)} match"
+            if len(self._matches) != 1:
+                status += "es"
+            if truncated:
+                status += (
+                    f". Showing first {len(self._matches)} due to the {SEQUENCE_ANALYZER_MAX_TRACE_MATCHES} result limit."
+                )
+            else:
+                status += ". Select a row and choose Set Binary Offset to apply."
+        else:
+            status = "No matches found in the trace."
+        self.results_status.setText(status)
+        self._update_set_offset_button_state()
+
+    def _selected_match_row(self) -> int | None:
+        selection = self.results_table.selectionModel()
+        if selection is None or not selection.hasSelection():
+            return None
+        rows = sorted({index.row() for index in selection.selectedRows()})
+        if not rows:
+            return None
+        row = rows[0]
+        if row >= len(self._matches):
+            return None
+        return row
+
+    def _update_set_offset_button_state(self) -> None:
+        enabled = self._selected_match_row() is not None
+        if hasattr(self, "set_offset_button"):
+            self.set_offset_button.setEnabled(enabled)
+
+    def _handle_set_offset_clicked(self) -> None:
+        row = self._selected_match_row()
+        if row is None:
+            return
+        match = self._matches[row]
+        try:
+            offset_value = int(match.get("offset", 0))
+        except Exception:
+            QMessageBox.warning(self, "Invalid offset", "Unable to determine offset for the selected match.")
+            return
+        self.results_status.setText(
+            f"Selected offset {self._format_offset(offset_value)}. Preview will update when this window closes."
+        )
+        self.offset_selected.emit(int(offset_value))
+        self.accept()
+
+    def _update_find_progress(self, processed: int, total: int) -> None:
+        dialog = self._find_progress_dialog
+        if not dialog:
+            return
+        total_value = total if total > 0 else max(self._find_total_positions, 0)
+        processed_value = max(0, min(processed, total_value)) if total_value else processed
+        dialog.setRange(0, max(total_value, 0))
+        dialog.setValue(processed_value)
+        if total_value:
+            dialog.setLabelText(f"Scanning trace ({processed_value}/{total_value})")
+        else:
+            dialog.setLabelText("Scanning trace...")
+
+    def _handle_find_succeeded(self, payload: object) -> None:
+        if isinstance(payload, dict):
+            matches = list(payload.get("matches", []))
+            truncated = bool(payload.get("truncated", False))
+        else:
+            matches = list(payload) if isinstance(payload, list) else []
+            truncated = False
+        self._populate_results(matches, truncated=truncated)
+        self._cleanup_find_worker()
+
+    def _handle_find_cancelled(self) -> None:
+        self.results_status.setText("Trace search cancelled.")
+        self._cleanup_find_worker()
+
+    def _handle_find_failed(self, message: str) -> None:
+        QMessageBox.warning(self, "Trace search failed", message)
+        self._cleanup_find_worker()
+
+    def _cleanup_find_worker(self) -> None:
+        if self._find_progress_dialog:
+            self._find_progress_dialog.close()
+            self._find_progress_dialog.deleteLater()
+            self._find_progress_dialog = None
+        if self._find_thread:
+            self._find_thread.quit()
+            self._find_thread.wait()
+        if self._find_worker:
+            self._find_worker.deleteLater()
+            self._find_worker = None
+        if self._find_thread:
+            self._find_thread.deleteLater()
+            self._find_thread = None
+        self._find_total_positions = 0
+        self._update_find_button_state()
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        if self._find_worker:
+            self._find_worker.cancel()
+            self._cleanup_find_worker()
+        super().closeEvent(event)
+
+    @staticmethod
+    def _normalize_instruction(text: str | None) -> str:
+        if not text:
+            return ""
+        return " ".join(text.lower().split())
+
+    @staticmethod
+    def _format_offset(value: int) -> str:
+        sign = "+" if value >= 0 else "-"
+        return f"{sign}0x{abs(value):x}"
+
+    @staticmethod
+    def _has_binary_instruction(text: str | None) -> bool:
+        clean = (text or "").strip()
+        return bool(clean) and not clean.startswith("<")
+
+
 class DiffDialog(QDialog):
     def __init__(self, parent: QWidget, title: str, content: str) -> None:
         super().__init__(parent)
@@ -430,57 +2386,9 @@ class DiffDialog(QDialog):
         self.buttons.rejected.connect(self.reject)
         layout.addWidget(self.view)
         layout.addWidget(self.buttons)
+        self.resize(720, 520)
 
 
-class ApplyOptionsDialog(QDialog):
-    def __init__(self, parent: QWidget) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("Apply Options")
-        layout = QVBoxLayout(self)
-
-        self.remove_duplicates_checkbox = QCheckBox("Remove duplicate rows", self)
-        layout.addWidget(self.remove_duplicates_checkbox)
-
-        self.sort_checkbox = QCheckBox("Sort output", self)
-        layout.addWidget(self.sort_checkbox)
-
-        sort_row = QHBoxLayout()
-        sort_row.addWidget(QLabel("Order:", self))
-        self.sort_order_combo = QComboBox(self)
-        self.sort_order_combo.addItem("Ascending", True)
-        self.sort_order_combo.addItem("Descending", False)
-        self.sort_order_combo.setEnabled(False)
-        sort_row.addWidget(self.sort_order_combo)
-        sort_row.addStretch()
-        layout.addLayout(sort_row)
-
-        self.uniform_checkbox = QCheckBox("Force row uniformity", self)
-        self.uniform_checkbox.setEnabled(False)
-        self.uniform_checkbox.setToolTip("Enable by reducing the preview to a single column.")
-        layout.addWidget(self.uniform_checkbox)
-
-        self.sort_checkbox.toggled.connect(self.sort_order_combo.setEnabled)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-
-    def set_uniform_available(self, available: bool) -> None:
-        self.uniform_checkbox.setEnabled(available)
-        if not available:
-            self.uniform_checkbox.setChecked(False)
-            self.uniform_checkbox.setToolTip("Enable by reducing the preview to a single column.")
-        else:
-            self.uniform_checkbox.setToolTip("Rows that differ from the majority length will be saved separately.")
-
-    def selected_options(self) -> dict[str, object]:
-        return {
-            "remove_duplicates": self.remove_duplicates_checkbox.isChecked(),
-            "sort_enabled": self.sort_checkbox.isChecked(),
-            "sort_ascending": bool(self.sort_order_combo.currentData()),
-            "force_uniform": self.uniform_checkbox.isChecked(),
-        }
 class App(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -515,11 +2423,30 @@ class App(QMainWindow):
         self._cached_log_entry_id: str | None = None
         self._cached_log_truncated = False
         self._cached_log_path: Path | None = None
-        self._current_column_mapping: list[int] = []
-        self._explicit_removed_columns: set[int] = set()
-        self._column_offset_adjustments: dict[int, int] = {}
-        self._current_sort: tuple[int, bool] | None = None
-        self._action_history: list[str] = []
+        self._cached_preview_processed = False
+        self._cached_preview_segment_count = 0
+        self._preview_cache: dict[tuple[object, ...], dict[str, object]] = {}
+        self._preview_jobs: dict[int, dict[str, object]] = {}
+        self._preview_live_lines: list[str] = []
+        self._preview_view_has_content = False
+        self._preview_job_counter = 0
+        self._current_preview_job_id: int | None = None
+        self._current_preview_key: tuple[object, ...] | None = None
+        self._current_preview_thread: QThread | None = None
+        self._current_preview_worker: LogPreviewWorker | None = None
+        self._preview_context: dict[str, object] | None = None
+        self._preview_progress: dict[str, int] = {}
+        self._segment_preview_job_counter = 0
+        self._segment_preview_jobs: dict[int, dict[str, object]] = {}
+        self._current_segment_job_id: int | None = None
+        self._segment_preview_context: dict[str, object] | None = None
+        self._segment_selection_updating = False
+        self._active_segment_entry_id: str | None = None
+        self._active_segment_row: int | None = None
+        self._segment_preview_cache: dict[tuple[str, int, float], dict[str, object]] = {}
+        self._sanitization_preview_thread: QThread | None = None
+        self._sanitization_preview_worker: SanitizationPreviewWorker | None = None
+        self._sanitization_preview_dialog: QProgressDialog | None = None
         self._console_collapsed = False
         self._console_saved_size = 180
         self._console_header_only_height = 48
@@ -531,6 +2458,9 @@ class App(QMainWindow):
         self._revng_status_summary = "rev.ng status not checked."
         self._revng_status_detail = "rev.ng status not checked."
         self._cached_sudo_password: str | None = None
+        self._status_icon_cache: dict[str, QIcon] = {}
+        self._last_module_filters: list[str] | None = None
+        self._gui_invoker = GuiInvoker(self)
         self._setup_ui()
         initial_log_path = self._project_log_path(self.active_project)
         self.controller = RunnerController(
@@ -652,13 +2582,6 @@ class App(QMainWindow):
         tool_row.addWidget(self.build_tool_button)
         config_layout.addLayout(tool_row)
 
-        self.ghidra_path = QLineEdit(config_tab)
-        self.ghidra_path.setPlaceholderText("Ghidra AnalyzeHeadless executable path")
-        self.ghidra_path.setText(self.config.ghidra_path)
-        self.ghidra_path.setReadOnly(True)
-        self.ghidra_button = QPushButton("Select", config_tab)
-        config_layout.addLayout(_build_config_row("Ghidra AnalyzeHeadless", self.ghidra_path, self.ghidra_button))
-
         self.revng_image_input = QLineEdit(config_tab)
         self.revng_image_input.setPlaceholderText("revng/revng")
         self.revng_image_input.setText(getattr(self.config, "revng_docker_image", "revng/revng"))
@@ -679,47 +2602,28 @@ class App(QMainWindow):
         self.logs_list = QListWidget(logs_tab)
         self.logs_list.setSelectionMode(QAbstractItemView.SingleSelection)
         self.logs_list.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.logs_list.customContextMenuRequested.connect(self._show_logs_list_context_menu)
         self.create_log_button = QPushButton("Execute Binary", logs_tab)
+        self.prepare_honey_button = QPushButton("Prepare for HoneyProc", logs_tab)
+        self.prepare_honey_button.setEnabled(False)
         self.delete_log_button = QPushButton("Delete Selected Log", logs_tab)
         self.log_preview_label = QLabel("Instruction Trace", logs_tab)
-        self.log_preview = QTableWidget(logs_tab)
-        self.log_preview.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.log_preview.setSelectionBehavior(QAbstractItemView.SelectColumns)
-        self.log_preview.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.log_preview.verticalHeader().setVisible(False)
+        self.log_preview = QPlainTextEdit(logs_tab)
+        self.log_preview.setReadOnly(True)
+        self.log_preview.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        preview_font = self.log_preview.font()
+        preview_font.setFamilies(["Monospace", "Courier New", preview_font.defaultFamily()])
+        preview_font.setStyleHint(QFont.StyleHint.Monospace)
+        self.log_preview.setFont(preview_font)
         self.log_preview.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.log_preview.customContextMenuRequested.connect(self._show_log_table_context_menu)
-        header = self.log_preview.horizontalHeader()
-        header.setStretchLastSection(True)
-        header.setSectionsClickable(True)
-        header.setHighlightSections(True)
+        self.log_preview.customContextMenuRequested.connect(self._show_log_preview_context_menu)
         self.log_preview_status = QLabel("", logs_tab)
         self.log_preview_status.setObjectName("logPreviewStatus")
         self.log_preview_status.setStyleSheet("color: #666; font-size: 11px;")
-        preview_options = QHBoxLayout()
-        self.log_delimiter_input = QLineEdit(logs_tab)
-        self.log_delimiter_input.setPlaceholderText("Delimiter (space by default)")
-        self.log_delimiter_input.setText(" ")
-        preview_options.addWidget(QLabel("Delimiter:", logs_tab))
-        preview_options.addWidget(self.log_delimiter_input)
-        self.apply_delimiter_button = QPushButton("Apply", logs_tab)
-        self.reset_columns_button = QPushButton("Reset Columns", logs_tab)
-        self.apply_actions_button = QPushButton("Apply To File", logs_tab)
-        preview_options.addWidget(self.apply_delimiter_button)
-        preview_options.addWidget(self.reset_columns_button)
-        preview_options.addWidget(self.apply_actions_button)
-        self.log_actions_indicator = ClickableIndicator("Fix Actions: 0", logs_tab)
-        self.log_actions_indicator.setToolTip("No fix actions recorded yet.")
-        self.log_actions_indicator.setEnabled(False)
-        self.log_actions_indicator.setStyleSheet("color: #1976d2; text-decoration: underline;")
-        self.log_actions_indicator.clicked.connect(self._show_log_actions_popup)
-        preview_options.addWidget(self.log_actions_indicator)
-        preview_options.addStretch(1)
         header_row = QHBoxLayout()
         header_row.addWidget(self.logs_exec_label)
         header_row.addStretch(1)
         header_row.addWidget(self.create_log_button)
+        header_row.addWidget(self.prepare_honey_button)
         header_row.addWidget(self.delete_log_button)
         list_panel = QWidget(logs_tab)
         list_panel_layout = QVBoxLayout(list_panel)
@@ -731,9 +2635,26 @@ class App(QMainWindow):
         preview_layout = QVBoxLayout(preview_panel)
         preview_layout.setContentsMargins(0, 0, 0, 0)
         preview_layout.addWidget(self.log_preview_label)
+        self.log_segments_label = QLabel("Segments", preview_panel)
+        self.log_segments_label.setStyleSheet("font-weight: bold;")
+        self.log_segments_table = QTableWidget(0, 4, preview_panel)
+        self.log_segments_table.setHorizontalHeaderLabels(["#", "Start", "End", "Length"])
+        header = self.log_segments_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.Stretch)
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.log_segments_table.verticalHeader().setVisible(False)
+        self.log_segments_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.log_segments_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.log_segments_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.log_segments_table.itemSelectionChanged.connect(self._handle_segment_selection_changed)
+        self.log_segments_table.setVisible(False)
+        self.log_segments_label.setVisible(False)
+        preview_layout.addWidget(self.log_segments_label)
+        preview_layout.addWidget(self.log_segments_table)
         preview_layout.addWidget(self.log_preview)
         preview_layout.addWidget(self.log_preview_status)
-        preview_layout.addLayout(preview_options)
 
         self.logs_splitter = QSplitter(Qt.Vertical, logs_tab)
         self.logs_splitter.addWidget(list_panel)
@@ -761,11 +2682,13 @@ class App(QMainWindow):
         indicator_layout.addWidget(self.revng_status_indicator)
         indicator_layout.addStretch(1)
         indicator_widget.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
+        self.honey_preview_button = QPushButton("Preview Sanitization", honey_tab)
         self.honey_sanitize_button = QPushButton("Generate Sanitized Binary", honey_tab)
         self.honey_run_sanitized_button = QPushButton("Execute Sanitized", honey_tab)
         self.honey_reveal_button = QPushButton("Reveal Sanitized", honey_tab)
         self.honey_compare_button = QPushButton("Compare Logs", honey_tab)
         honey_buttons.addWidget(indicator_widget)
+        honey_buttons.addWidget(self.honey_preview_button)
         honey_buttons.addWidget(self.honey_sanitize_button)
         honey_buttons.addWidget(self.honey_run_sanitized_button)
         honey_buttons.addWidget(self.honey_reveal_button)
@@ -774,6 +2697,9 @@ class App(QMainWindow):
         honey_layout.addWidget(self.honey_entries_label)
         honey_layout.addWidget(self.honey_list)
         honey_layout.addLayout(honey_buttons)
+        self.honey_prepared_status = QLabel("Preparation: Select an entry.", honey_tab)
+        self.honey_prepared_status.setWordWrap(True)
+        honey_layout.addWidget(self.honey_prepared_status)
         self.honey_sanitized_status = QLabel("Sanitized binary: Not generated.", honey_tab)
         self.honey_sanitized_status.setWordWrap(True)
         self.honey_parent_status = QLabel("Parent linkage: N/A", honey_tab)
@@ -790,21 +2716,19 @@ class App(QMainWindow):
         self.binary_button.clicked.connect(self.select_binary)
         self.tool_button.clicked.connect(self.select_tool)
         self.build_tool_button.clicked.connect(self.build_tool)
-        self.ghidra_button.clicked.connect(self.select_ghidra_path)
         self.revng_image_input.editingFinished.connect(self._handle_revng_image_edit)
         self.revng_image_reset_button.clicked.connect(self._reset_revng_image)
-        self.log_delimiter_input.editingFinished.connect(self._refresh_log_preview_only)
-        self.apply_delimiter_button.clicked.connect(self._refresh_log_preview_only)
-        self.reset_columns_button.clicked.connect(self._reset_removed_columns)
-        header.setContextMenuPolicy(Qt.CustomContextMenu)
-        header.customContextMenuRequested.connect(self._show_header_context_menu)
-        self.apply_actions_button.clicked.connect(self._persist_column_cuts_to_file)
         self.project_list.currentTextChanged.connect(self.change_active_project)
         self.project_list.customContextMenuRequested.connect(self._show_project_context_menu)
         self.create_log_button.clicked.connect(self.create_new_log_entry)
         self.delete_log_button.clicked.connect(self.delete_log_entry)
+        self.prepare_honey_button.clicked.connect(self.prepare_log_for_honeyproc)
+        self.logs_list.customContextMenuRequested.connect(
+            lambda pos: self._show_logs_list_context_menu(self.logs_list, pos)
+        )
         self.logs_list.currentItemChanged.connect(self._handle_logs_selection_change)
         self.honey_list.currentItemChanged.connect(self._handle_honey_selection_change)
+        self.honey_preview_button.clicked.connect(self.preview_sanitization)
         self.honey_sanitize_button.clicked.connect(self.sanitize_honey_entry)
         self.honey_run_sanitized_button.clicked.connect(self.execute_sanitized_binary)
         self.honey_reveal_button.clicked.connect(self.reveal_sanitized_binary)
@@ -899,6 +2823,11 @@ class App(QMainWindow):
     def _project_log_path(self, project: str | None = None, *, run_label: str | None = None) -> Path:
         return self._project_storage_root(project) / self._project_log_filename(run_label=run_label)
 
+    def _default_run_label(self, binary_path: str | None = None) -> str:
+        binary_name = Path(binary_path).name if binary_path else "Run"
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        return f"{binary_name or 'Run'} @ {timestamp}"
+
     def _scripts_dir(self) -> Path:
         scripts_dir = Path(__file__).resolve().parents[1] / "scripts"
         scripts_dir.mkdir(parents=True, exist_ok=True)
@@ -992,6 +2921,7 @@ class App(QMainWindow):
         dialog.setWindowModality(Qt.ApplicationModal)
         dialog.setMinimumDuration(0)
         dialog.setLabelText(title)
+        dialog.resize(520, 200)
         dialog.show()
         QApplication.processEvents()
 
@@ -1784,21 +3714,6 @@ class App(QMainWindow):
         dialog.exec()
         self._cleanup_sanitize_worker()
 
-    def select_ghidra_path(self) -> None:
-        current = self.ghidra_path.text().strip() or str(Path.home())
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Select Ghidra AnalyzeHeadless",
-            current,
-            "Executable files (*)",
-        )
-        if not path:
-            return
-        self.ghidra_path.setText(path)
-        self.config.ghidra_path = path
-        self.config_manager.save(self.config)
-        self._append_console(f"Ghidra AnalyzeHeadless set to: {path}")
-
     def _handle_revng_image_edit(self) -> None:
         if not hasattr(self, "revng_image_input"):
             return
@@ -1893,8 +3808,20 @@ class App(QMainWindow):
         if not self.selected_binary:
             QMessageBox.warning(self, "No binary", "Please select a binary before running.")
             return
-        log_path = str(self._project_log_path())
-        self._run_and_record(self.selected_binary, log_path)
+        dialog_result = self._prompt_module_selection(
+            self.selected_binary,
+            default_log_label=self._default_run_label(self.selected_binary),
+        )
+        if dialog_result is None:
+            return
+        module_filters, log_label = dialog_result
+        log_path = str(self._project_log_path(run_label=log_label))
+        self._run_and_record(
+            self.selected_binary,
+            log_path,
+            run_label=log_label,
+            module_filters=module_filters,
+        )
 
     def create_new_log_entry(self) -> None:
         if self._current_run_thread and self._current_run_thread.isRunning():
@@ -1907,18 +3834,22 @@ class App(QMainWindow):
         self.selected_binary = binary
         self.binary_path.setText(binary)
         self._update_honey_entries_label()
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        default_name = f"{Path(binary).name} @ {timestamp}"
-        name, ok = QInputDialog.getText(self, "Execute Binary", "Run name:", text=default_name)
-        run_label = name.strip()
-        if not ok or not run_label:
+        default_label = self._default_run_label(binary)
+        dialog_result = self._prompt_module_selection(binary, default_log_label=default_label)
+        if dialog_result is None:
             return
-        log_path = str(self._project_log_path(run_label=run_label))
-        self._run_with_progress(binary, log_path, run_label=run_label, dialog_label=run_label)
+        module_filters, log_label = dialog_result
+        log_path = str(self._project_log_path(run_label=log_label))
+        self._run_with_progress(
+            binary,
+            log_path,
+            run_label=log_label,
+            dialog_label=log_label,
+            module_filters=module_filters,
+        )
 
     def delete_log_entry(self) -> None:
-        current_item = self.logs_list.currentItem()
-        entry = self._entry_from_item(current_item)
+        entry = self._current_log_entry()
         if not entry:
             QMessageBox.information(self, "No log selected", "Select a log entry to delete.")
             return
@@ -1935,6 +3866,107 @@ class App(QMainWindow):
         self._refresh_entry_views(None)
         self._persist_current_history()
         self._append_console(f"Deleted log entry: {entry.name}")
+
+    def prepare_log_for_honeyproc(self) -> None:
+        entry = self._current_log_entry()
+        if not entry:
+            QMessageBox.information(self, "No log selected", "Select a log entry to prepare.")
+            return
+        if entry.is_sanitized_run:
+            QMessageBox.information(
+                self,
+                "Preparation unavailable",
+                "Sanitized replay entries inherit preparation from their parent and do not need this step.",
+            )
+            return
+        if self._entry_prepared(entry):
+            QMessageBox.information(
+                self,
+                "Already prepared",
+                f"'{entry.name}' is already ready for HoneyProc.",
+            )
+            self._update_prepare_button_state(entry)
+            return
+        progress = QProgressDialog("Preparing HoneyProc data...", None, 0, 3, self)
+        progress.setWindowTitle("Prepare for HoneyProc")
+        progress.setCancelButton(None)
+        progress.setWindowModality(Qt.ApplicationModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        progress.setLabelText("Validating log selection...")
+        progress.resize(580, 240)
+        progress.show()
+        QApplication.processEvents()
+
+        button = getattr(self, "prepare_honey_button", None)
+        if button is not None:
+            button.setEnabled(False)
+
+        def advance(step: int, label: str) -> None:
+            progress.setValue(step)
+            progress.setLabelText(label)
+            QApplication.processEvents()
+
+        try:
+            log_path_value = self._entry_field(entry, "log_path")
+            if not log_path_value:
+                QMessageBox.warning(self, "Missing log", "This entry does not reference a log file to prepare.")
+                return
+            log_path = Path(log_path_value)
+            if not log_path.exists():
+                QMessageBox.warning(
+                    self,
+                    "Log not found",
+                    f"The instruction log could not be found at {log_path}. Re-run the entry to regenerate it.",
+                )
+                return
+            advance(1, "Parsing instruction log...")
+            try:
+                parsed_entries = parser.parse_log(log_path)
+            except Exception as exc:
+                QMessageBox.critical(
+                    self,
+                    "Unable to parse log",
+                    f"Failed to load the instruction log for preparation:\n{exc}",
+                )
+                return
+            if not parsed_entries:
+                QMessageBox.information(
+                    self,
+                    "Empty log",
+                    "No instruction entries were discovered in the log. Nothing to prepare.",
+                )
+                return
+            advance(2, "Computing contiguous segments...")
+            addresses, segments = compute_address_segments(parsed_entries, max_gap=HONEY_SEGMENT_MAX_GAP)
+            if not segments:
+                QMessageBox.information(
+                    self,
+                    "No contiguous segments",
+                    "Unable to derive contiguous memory segments from this log.",
+                )
+                return
+            entry.prepared_segments = segments
+            entry.prepared_at = datetime.now()
+            self._persist_current_history()
+            self._refresh_entry_views(entry.entry_id)
+            segment_count = len(segments)
+            address_count = len(addresses)
+            self._append_console(
+                f"Prepared '{entry.name}' for HoneyProc: {segment_count} segment(s) covering {address_count} addresses."
+            )
+            QMessageBox.information(
+                self,
+                "HoneyProc ready",
+                (
+                    f"'{entry.name}' is ready for HoneyProc.\n"
+                    f"Segments detected: {segment_count}. Unique addresses: {address_count}."
+                ),
+            )
+        finally:
+            progress.setValue(progress.maximum())
+            progress.close()
+            self._update_prepare_button_state(self._current_log_entry())
 
     def change_active_project(self, project_name: str) -> None:
         if not project_name or project_name == self.active_project:
@@ -2042,28 +4074,38 @@ class App(QMainWindow):
         self._persist_current_history()
 
     def _refresh_entry_views(self, newly_added_id: str | None = None) -> None:
-        self.logs_list.blockSignals(True)
+        log_list = getattr(self, "logs_list", None)
+        current_entry = self._current_log_entry()
+        preferred_id = newly_added_id or (current_entry.entry_id if current_entry else None)
+
+        if log_list is not None:
+            log_list.blockSignals(True)
+            log_list.clear()
         self.honey_list.blockSignals(True)
-        self.logs_list.clear()
         self.honey_list.clear()
+
         for entry in self.run_entries:
             label = entry.label()
-            log_item = QListWidgetItem(label)
-            log_item.setData(Qt.UserRole, entry.entry_id)
-            honey_item = QListWidgetItem(label)
-            honey_item.setData(Qt.UserRole, entry.entry_id)
-            self.logs_list.addItem(log_item)
-            self.honey_list.addItem(honey_item)
-            if newly_added_id and entry.entry_id == newly_added_id:
-                self.logs_list.setCurrentItem(log_item)
-                self.honey_list.setCurrentItem(honey_item)
-        if self.logs_list.count() > 0 and self.logs_list.currentRow() == -1:
-            self.logs_list.setCurrentRow(0)
+            if log_list is not None:
+                log_item = QListWidgetItem(label)
+                log_item.setData(Qt.UserRole, entry.entry_id)
+                self._apply_log_item_indicator(log_item, entry)
+                log_list.addItem(log_item)
+            if self._entry_is_honey_ready(entry):
+                honey_item = QListWidgetItem(label)
+                honey_item.setData(Qt.UserRole, entry.entry_id)
+                self.honey_list.addItem(honey_item)
+
+        if log_list is not None:
+            if log_list.count() > 0 and log_list.currentRow() == -1:
+                log_list.setCurrentRow(0)
+            log_list.blockSignals(False)
         if self.honey_list.count() > 0 and self.honey_list.currentRow() == -1:
             self.honey_list.setCurrentRow(0)
-        self.logs_list.blockSignals(False)
         self.honey_list.blockSignals(False)
-        self.update_log_detail_from_selection(self.logs_list.currentItem(), None)
+
+        self._sync_log_lists_to_entry(preferred_id)
+        self.update_log_detail_from_selection(self._current_log_item(), None)
         self._update_honey_buttons()
         self._update_honey_detail(self._current_honey_entry())
 
@@ -2078,10 +4120,561 @@ class App(QMainWindow):
             return None
         return next((entry for entry in self.run_entries if entry.entry_id == entry_id), None)
 
-    def _current_log_entry(self) -> RunEntry | None:
-        if not hasattr(self, "logs_list"):
+    def _entry_field(self, entry: RunEntry | dict | None, attr: str, default=None):
+        if entry is None:
+            return default
+        if hasattr(entry, attr):
+            return getattr(entry, attr)
+        if isinstance(entry, dict):
+            return entry.get(attr, default)
+        return default
+
+    def _entry_segments(self, entry: RunEntry | None) -> list[tuple[int, int]]:
+        if entry is None:
+            return []
+        if entry.prepared_segments:
+            return list(entry.prepared_segments)
+        if entry.is_sanitized_run and entry.parent_entry_id:
+            parent = self._entry_by_id(entry.parent_entry_id)
+            if parent and parent.prepared_segments:
+                return list(parent.prepared_segments)
+        return []
+
+    def _entry_is_processed(self, entry: RunEntry | None) -> bool:
+        return bool(self._entry_segments(entry))
+
+    def _log_indicator_for_entry(self, entry: RunEntry) -> LogIndicator:
+        segments = self._entry_segments(entry)
+        if segments:
+            tip = f"Processed for HoneyProc with {len(segments)} segment(s)."
+            return LogIndicator("#2e7d32", tip, "processed")
+        log_path = Path(entry.log_path) if entry.log_path else None
+        if log_path is None:
+            return LogIndicator("#c62828", "No log path recorded for this run.", "error")
+        if not log_path.exists():
+            return LogIndicator("#c62828", f"Log missing on disk: {log_path}", "error")
+        return LogIndicator("#fbc02d", "Not processed yet. Use 'Prepare for HoneyProc'.", "pending")
+
+    def _status_icon_for_color(self, color: str) -> QIcon:
+        icon = self._status_icon_cache.get(color)
+        if icon is not None:
+            return icon
+        pixmap = QPixmap(14, 14)
+        pixmap.fill(Qt.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setBrush(QColor(color))
+        painter.setPen(Qt.NoPen)
+        painter.drawEllipse(2, 2, 10, 10)
+        painter.end()
+        icon = QIcon(pixmap)
+        self._status_icon_cache[color] = icon
+        return icon
+
+    def _apply_log_item_indicator(self, item: QListWidgetItem, entry: RunEntry) -> None:
+        indicator = self._log_indicator_for_entry(entry)
+        item.setIcon(self._status_icon_for_color(indicator.color))
+        item.setToolTip(indicator.tooltip)
+        item.setData(Qt.UserRole + 1, indicator.state)
+
+    def _current_log_item(self) -> QListWidgetItem | None:
+        widget = getattr(self, "logs_list", None)
+        if widget is None:
             return None
-        return self._entry_from_item(self.logs_list.currentItem())
+        return widget.currentItem()
+
+    def _sync_log_lists_to_entry(self, entry_id: str | None) -> None:
+        widget = getattr(self, "logs_list", None)
+        if widget is None:
+            return
+        self._sync_selection_to_entry(widget, entry_id)
+
+    def _entry_prepared(self, entry: RunEntry | dict | None) -> bool:
+        segments = self._entry_field(entry, "prepared_segments")
+        return bool(segments)
+
+    def _entry_is_honey_ready(self, entry: RunEntry | None) -> bool:
+        if not entry:
+            return False
+        if entry.is_sanitized_run:
+            return True
+        return self._entry_prepared(entry)
+
+    def _preview_cache_key(
+        self,
+        entry: RunEntry,
+        *,
+        processed: bool,
+        segments: list[tuple[int, int]],
+        path: Path,
+    ) -> tuple[object, ...]:
+        try:
+            stat_info = path.stat()
+            mtime = int(getattr(stat_info, "st_mtime_ns", int(stat_info.st_mtime * 1_000_000_000)))
+        except OSError:
+            mtime = 0
+        segment_fingerprint: tuple[tuple[int, int], ...]
+        if processed:
+            segment_fingerprint = tuple(segments)
+        else:
+            segment_fingerprint = tuple()
+        return (entry.entry_id, processed, segment_fingerprint, mtime)
+
+    def _apply_cached_preview(self, cache_entry: dict[str, object]) -> None:
+        lines = list(cache_entry.get("lines", []))
+        truncated = bool(cache_entry.get("truncated", False))
+        processed = bool(cache_entry.get("processed", False))
+        segments = int(cache_entry.get("segments", 0) or 0)
+        path = cache_entry.get("path")
+        self._preview_live_lines = list(lines)
+        self._cached_log_lines = list(lines)
+        self._cached_log_truncated = truncated
+        self._cached_preview_processed = processed
+        self._cached_preview_segment_count = segments
+        self._preview_context = None
+        self._preview_progress = {}
+        self._preview_view_has_content = True
+        if hasattr(self, "log_preview"):
+            self.log_preview.setPlainText("\n".join(lines))
+        actual_path = path if isinstance(path, Path) else None
+        self._update_log_preview_status(
+            truncated,
+            actual_path,
+            len(lines),
+            processed=processed,
+            segments=segments,
+        )
+
+    def _cancel_active_preview_job(self) -> None:
+        job_id = self._current_preview_job_id
+        if job_id is None:
+            return
+        job = self._preview_jobs.get(job_id)
+        if not job:
+            self._current_preview_job_id = None
+            self._current_preview_key = None
+            self._preview_context = None
+            self._preview_progress = {}
+            return
+        worker = job.get("worker")
+        self._current_preview_job_id = None
+        self._current_preview_key = None
+        self._preview_context = None
+        self._preview_progress = {}
+        if isinstance(worker, LogPreviewWorker):
+            worker.cancel()
+
+    def _cleanup_preview_job(self, job_id: int) -> None:
+        job = self._preview_jobs.pop(job_id, None)
+        if not job:
+            return
+        thread = job.get("thread")
+        worker = job.get("worker")
+        if isinstance(worker, LogPreviewWorker):
+            worker.deleteLater()
+        if isinstance(thread, QThread):
+            thread.quit()
+            thread.wait()
+            thread.deleteLater()
+        if self._current_preview_job_id == job_id:
+            self._current_preview_job_id = None
+            self._current_preview_key = None
+            self._preview_context = None
+            self._preview_progress = {}
+
+    def _update_preview_loading_status(self) -> None:
+        label = getattr(self, "log_preview_status", None)
+        if label is None:
+            return
+        context = self._preview_context
+        if not context:
+            return
+        path = context.get("path")
+        path_name = path.name if isinstance(path, Path) else "log"
+        mode = context.get("mode")
+        if mode == "segments":
+            total = int(context.get("segments", 0) or 0)
+            done = int(self._preview_progress.get("segments", 0) or 0)
+            suffix = "segment" if total == 1 else "segments"
+            label.setText(f"Collecting segment previews ({done}/{total} {suffix}) from {path_name}...")
+        else:
+            lines = int(self._preview_progress.get("lines", 0) or 0)
+            label.setText(f"Streaming {path_name}: {lines} line(s) buffered...")
+
+    def _preview_job_id_from_sender(self) -> int | None:
+        sender = self.sender()
+        if isinstance(sender, LogPreviewWorker) and isinstance(sender.job_id, int):
+            return sender.job_id
+        if sender is None:
+            return None
+        for job_id, payload in self._preview_jobs.items():
+            if payload.get("worker") is sender:
+                return job_id
+        return None
+
+    @Slot(object)
+    def _on_preview_chunk(self, payload: object) -> None:
+        job_id = self._preview_job_id_from_sender()
+        if job_id is None or not isinstance(payload, list):
+            return
+        self._handle_preview_chunk(job_id, payload)
+
+    @Slot(object)
+    def _on_preview_progress(self, payload: object) -> None:
+        job_id = self._preview_job_id_from_sender()
+        if job_id is None or not isinstance(payload, dict):
+            return
+        self._handle_preview_progress(job_id, payload)
+
+    @Slot(bool)
+    def _on_preview_finished(self, truncated: bool) -> None:
+        job_id = self._preview_job_id_from_sender()
+        if job_id is None:
+            return
+        self._handle_preview_finished(job_id, truncated)
+
+    @Slot(str)
+    def _on_preview_failed(self, message: str) -> None:
+        job_id = self._preview_job_id_from_sender()
+        if job_id is None:
+            return
+        self._handle_preview_failed(job_id, message)
+
+    @Slot()
+    def _on_preview_cancelled(self) -> None:
+        job_id = self._preview_job_id_from_sender()
+        if job_id is None:
+            return
+        self._handle_preview_cancelled(job_id)
+
+    def _handle_preview_chunk(self, job_id: int, lines: list[str]) -> None:
+        if job_id != self._current_preview_job_id:
+            return
+        if not lines or not hasattr(self, "log_preview"):
+            return
+        self._preview_live_lines.extend(lines)
+        self._cached_log_lines = list(self._preview_live_lines)
+        block = "\n".join(lines)
+        if not self._preview_view_has_content:
+            self.log_preview.setPlainText(block)
+            self._preview_view_has_content = True
+        else:
+            self.log_preview.appendPlainText(block)
+        if self._preview_context and self._preview_context.get("mode") != "segments":
+            self._preview_progress["lines"] = len(self._preview_live_lines)
+            self._update_preview_loading_status()
+
+    def _handle_preview_progress(self, job_id: int, payload: dict | None) -> None:
+        if job_id != self._current_preview_job_id or payload is None:
+            return
+        if not isinstance(payload, dict):
+            return
+        self._preview_progress.update(payload)
+        self._update_preview_loading_status()
+
+    def _finalize_preview_job(
+        self,
+        job_id: int,
+        *,
+        truncated: bool,
+        success: bool,
+        message: str | None = None,
+    ) -> None:
+        if job_id != self._current_preview_job_id:
+            self._cleanup_preview_job(job_id)
+            return
+        path = None
+        if self._preview_context:
+            path = self._preview_context.get("path")
+        processed = bool(self._preview_context and self._preview_context.get("mode") == "segments")
+        segments = int(self._preview_context.get("segments", 0) or 0) if processed else 0
+        if success:
+            self._cached_log_lines = list(self._preview_live_lines)
+            self._cached_log_truncated = truncated
+            self._cached_preview_processed = processed
+            self._cached_preview_segment_count = segments
+            cache_key = self._current_preview_key
+            if cache_key is not None:
+                self._preview_cache[cache_key] = {
+                    "lines": list(self._preview_live_lines),
+                    "truncated": truncated,
+                    "processed": processed,
+                    "segments": segments,
+                    "path": path,
+                }
+            self._update_log_preview_status(
+                truncated,
+                path if isinstance(path, Path) else None,
+                len(self._preview_live_lines),
+                processed=processed,
+                segments=segments,
+            )
+        else:
+            status = getattr(self, "log_preview_status", None)
+            if status is not None and message:
+                status.setText(message)
+        self._cleanup_preview_job(job_id)
+
+    def _handle_preview_finished(self, job_id: int, truncated: bool) -> None:
+        self._finalize_preview_job(job_id, truncated=truncated, success=True)
+
+    def _handle_preview_failed(self, job_id: int, message: str) -> None:
+        detail = f"Unable to load instruction log: {message}" if message else "Unable to load instruction log."
+        self._finalize_preview_job(job_id, truncated=False, success=False, message=detail)
+
+    def _handle_preview_cancelled(self, job_id: int) -> None:
+        if job_id == self._current_preview_job_id:
+            status = getattr(self, "log_preview_status", None)
+            if status is not None:
+                status.setText("Preview cancelled.")
+        self._cleanup_preview_job(job_id)
+
+    def _cancel_active_segment_job(self) -> None:
+        job_id = self._current_segment_job_id
+        if job_id is None:
+            return
+        job = self._segment_preview_jobs.get(job_id)
+        self._current_segment_job_id = None
+        self._segment_preview_context = None
+        if not job:
+            return
+        worker = job.get("worker")
+        if isinstance(worker, SegmentPreviewWorker):
+            worker.cancel()
+
+    def _cleanup_segment_job(self, job_id: int) -> None:
+        job = self._segment_preview_jobs.pop(job_id, None)
+        if not job:
+            return
+        thread = job.get("thread")
+        worker = job.get("worker")
+        if isinstance(worker, SegmentPreviewWorker):
+            worker.deleteLater()
+        if isinstance(thread, QThread):
+            thread.quit()
+            thread.wait()
+            thread.deleteLater()
+        if self._current_segment_job_id == job_id:
+            self._current_segment_job_id = None
+            self._segment_preview_context = None
+
+    def _segment_job_id_from_sender(self) -> int | None:
+        sender = self.sender()
+        if isinstance(sender, SegmentPreviewWorker) and isinstance(sender.job_id, int):
+            return sender.job_id
+        if sender is None:
+            return None
+        for job_id, payload in self._segment_preview_jobs.items():
+            if payload.get("worker") is sender:
+                return job_id
+        return None
+
+    @Slot(object)
+    def _on_segment_preview_ready(self, payload: object) -> None:
+        job_id = self._segment_job_id_from_sender()
+        if job_id is None:
+            return
+        self._handle_segment_preview_result(job_id, payload)
+
+    @Slot(str)
+    def _on_segment_preview_failed(self, message: str) -> None:
+        job_id = self._segment_job_id_from_sender()
+        if job_id is None:
+            return
+        self._handle_segment_preview_failed(job_id, message)
+
+    @Slot()
+    def _on_segment_preview_cancelled(self) -> None:
+        job_id = self._segment_job_id_from_sender()
+        if job_id is None:
+            return
+        self._cleanup_segment_job(job_id)
+
+    def _begin_segment_preview_job(
+        self,
+        entry: RunEntry,
+        path: Path,
+        row: int,
+        start: int,
+        end: int,
+        cache_key: tuple[str, int, float],
+    ) -> None:
+        self._cancel_active_segment_job()
+        self._segment_preview_job_counter += 1
+        job_id = self._segment_preview_job_counter
+        worker = SegmentPreviewWorker(path, start=start, end=end, limit=SEGMENT_EDGE_PREVIEW_LIMIT)
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        worker.job_id = job_id
+        connection_type = Qt.ConnectionType.QueuedConnection
+        worker.result_ready.connect(self._on_segment_preview_ready, connection_type)
+        worker.failed.connect(self._on_segment_preview_failed, connection_type)
+        worker.cancelled.connect(self._on_segment_preview_cancelled, connection_type)
+        thread.started.connect(worker.run)
+        self._segment_preview_jobs[job_id] = {
+            "thread": thread,
+            "worker": worker,
+            "cache_key": cache_key,
+            "entry_id": entry.entry_id,
+            "row": row,
+        }
+        self._current_segment_job_id = job_id
+        self._segment_preview_context = {
+            "entry_id": entry.entry_id,
+            "row": row,
+            "path": path,
+            "start": start,
+            "end": end,
+            "cache_key": cache_key,
+            "job_id": job_id,
+        }
+        viewer = getattr(self, "log_preview", None)
+        status_label = getattr(self, "log_preview_status", None)
+        if viewer is not None:
+            viewer.clear()
+        if status_label is not None:
+            status_label.setText(f"Loading segment {row + 1} preview...")
+        thread.start()
+
+    def _apply_segment_preview_lines(
+        self,
+        *,
+        entry: RunEntry,
+        path: Path,
+        row: int,
+        start: int,
+        end: int,
+        lines: list[str],
+        total: int,
+        truncated: bool,
+    ) -> None:
+        viewer = getattr(self, "log_preview", None)
+        status_label = getattr(self, "log_preview_status", None)
+        label = getattr(self, "log_preview_label", None)
+        if viewer is None or status_label is None or label is None:
+            return
+        if not lines:
+            viewer.clear()
+            status_label.setText(
+                f"No instructions matched segment {row + 1} (0x{start:x} - 0x{end:x}) in {path.name}."
+            )
+            return
+        viewer.setPlainText("\n".join(lines))
+        label.setText(f"Segment {row + 1}: 0x{start:x} - 0x{end:x}")
+        status_bits = []
+        if truncated:
+            status_bits.append("Preview truncated")
+        if total:
+            status_bits.append(f"Showing {len(lines)} of {total} instructions")
+        status_label.setText("; ".join(status_bits) if status_bits else "Preview ready.")
+
+    def _handle_segment_preview_result(self, job_id: int, payload: object) -> None:
+        if job_id != self._current_segment_job_id:
+            self._cleanup_segment_job(job_id)
+            return
+        context = self._segment_preview_context or {}
+        if context.get("job_id") != job_id:
+            self._cleanup_segment_job(job_id)
+            return
+        if not isinstance(payload, dict):
+            self._cleanup_segment_job(job_id)
+            return
+        lines = list(payload.get("lines", [])) if isinstance(payload.get("lines"), list) else []
+        total = int(payload.get("total", 0) or 0)
+        truncated = bool(payload.get("truncated", False))
+        start = int(payload.get("start", context.get("start", 0)) or 0)
+        end = int(payload.get("end", context.get("end", 0)) or 0)
+        entry = self._current_log_entry()
+        if entry is None or entry.entry_id != context.get("entry_id"):
+            self._cleanup_segment_job(job_id)
+            return
+        row = context.get("row")
+        path = context.get("path")
+        cache_key = context.get("cache_key")
+        if not isinstance(row, int) or not isinstance(path, Path):
+            self._cleanup_segment_job(job_id)
+            return
+        if cache_key:
+            self._segment_preview_cache[cache_key] = {
+                "lines": list(lines),
+                "total": total,
+                "truncated": truncated,
+            }
+        self._apply_segment_preview_lines(
+            entry=entry,
+            path=path,
+            row=row,
+            start=start,
+            end=end,
+            lines=lines,
+            total=total,
+            truncated=truncated,
+        )
+        self._cleanup_segment_job(job_id)
+
+    def _handle_segment_preview_failed(self, job_id: int, message: str | None = None) -> None:
+        if job_id == self._current_segment_job_id:
+            status = getattr(self, "log_preview_status", None)
+            if status is not None:
+                detail = message or "Unable to load segment preview."
+                status.setText(detail)
+        self._cleanup_segment_job(job_id)
+
+    def _begin_preview_loading(
+        self,
+        entry: RunEntry,
+        path: Path,
+        segments: list[tuple[int, int]],
+        processed: bool,
+        cache_key: tuple[object, ...],
+    ) -> None:
+        self._cancel_active_preview_job()
+        self._preview_job_counter += 1
+        job_id = self._preview_job_counter
+        mode = "segments" if processed else "raw"
+        self._preview_context = {"mode": mode, "path": path, "segments": len(segments)}
+        self._preview_progress = {"segments": 0} if processed else {"lines": 0}
+        self._preview_live_lines = []
+        self._preview_view_has_content = False
+        self._cached_preview_processed = processed
+        self._cached_preview_segment_count = len(segments) if processed else 0
+        worker = LogPreviewWorker(
+            path,
+            mode=mode,
+            max_chars=self._log_preview_max_chars,
+            segments=segments,
+            per_segment_limit=SEGMENT_EDGE_PREVIEW_LIMIT,
+        )
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        connection_type = Qt.ConnectionType.QueuedConnection
+        worker.job_id = job_id
+        thread.started.connect(worker.run)
+        worker.chunk_ready.connect(self._on_preview_chunk, connection_type)
+        worker.progress.connect(self._on_preview_progress, connection_type)
+        worker.finished.connect(self._on_preview_finished, connection_type)
+        worker.failed.connect(self._on_preview_failed, connection_type)
+        worker.cancelled.connect(self._on_preview_cancelled, connection_type)
+        self._preview_jobs[job_id] = {"thread": thread, "worker": worker}
+        self._current_preview_job_id = job_id
+        self._current_preview_key = cache_key
+        self._update_preview_loading_status()
+        thread.start()
+
+    def _update_prepare_button_state(self, entry: RunEntry | None) -> None:
+        button = getattr(self, "prepare_honey_button", None)
+        if button is None:
+            return
+        can_prepare = (
+            entry is not None
+            and not entry.is_sanitized_run
+            and not self._entry_prepared(entry)
+        )
+        button.setEnabled(can_prepare)
+
+    def _current_log_entry(self) -> RunEntry | None:
+        item = self._current_log_item()
+        return self._entry_from_item(item)
 
     def _open_log_directory(self, entry: RunEntry | None = None) -> None:
         candidate = entry or self._current_log_entry()
@@ -2150,10 +4743,13 @@ class App(QMainWindow):
     def _update_honey_detail(self, entry: RunEntry | None) -> None:
         if not hasattr(self, "honey_sanitized_status"):
             return
+        prepared_label = getattr(self, "honey_prepared_status", None)
         if not entry:
             self.honey_sanitized_status.setText("Sanitized binary: Select an entry.")
             if hasattr(self, "honey_parent_status"):
                 self.honey_parent_status.setText("Parent linkage: Select an entry.")
+            if prepared_label is not None:
+                prepared_label.setText("Preparation: Select an entry and run 'Prepare for HoneyProc' from the Logs tab.")
             return
         sanitized_path = entry.sanitized_binary_path
         if sanitized_path:
@@ -2180,6 +4776,17 @@ class App(QMainWindow):
                     )
                 else:
                     self.honey_parent_status.setText("Sanitized replay: Not generated.")
+        if prepared_label is not None:
+            if entry.is_sanitized_run:
+                prepared_label.setText("Preparation: Inherited from parent entry.")
+            elif self._entry_prepared(entry):
+                segments = len(entry.prepared_segments or [])
+                timestamp = entry.prepared_at.strftime("%Y-%m-%d %H:%M:%S") if entry.prepared_at else "unknown time"
+                prepared_label.setText(
+                    f"Prepared for HoneyProc with {segments} segment(s) (last run: {timestamp})."
+                )
+            else:
+                prepared_label.setText("Preparation required: Use 'Prepare for HoneyProc' from the Logs tab.")
             self._update_honey_entries_label()
 
     def _detect_revng(self, *, allow_prompt: bool = True) -> tuple[bool, str]:
@@ -2471,7 +5078,7 @@ class App(QMainWindow):
         buttons.rejected.connect(dialog.reject)
         dialog.finished.connect(lambda *_: self._apply_revng_indicator_state())
         refresh_labels()
-        dialog.resize(460, 260)
+        dialog.resize(640, 360)
         dialog.exec()
 
     def _update_honey_buttons(self, *_: object) -> None:
@@ -2482,8 +5089,17 @@ class App(QMainWindow):
         sanitized_ready = has_entry and self._sanitized_binary_ready(entry)
         sanitized_action_enabled = sanitized_ready and not busy
         compare_ready = self._resolve_compare_pair(entry) is not None
+        preview_ready = (
+            has_entry
+            and entry is not None
+            and bool((entry.log_path or "").strip())
+            and bool((entry.binary_path or "").strip())
+            and not busy
+        )
         if hasattr(self, "honey_sanitize_button"):
             self.honey_sanitize_button.setEnabled(enabled)
+        if hasattr(self, "honey_preview_button"):
+            self.honey_preview_button.setEnabled(preview_ready)
         if hasattr(self, "honey_run_sanitized_button"):
             self.honey_run_sanitized_button.setEnabled(sanitized_action_enabled)
         if hasattr(self, "honey_reveal_button"):
@@ -2509,29 +5125,29 @@ class App(QMainWindow):
                 display = candidate
         else:
             display = "HoneyPot"
-        return f"Execution Logs for {display}"
+        return f"HoneyProc entries for {display}"
 
     def _update_honey_entries_label(self) -> None:
         label = getattr(self, "honey_entries_label", None)
         if label is None:
             return
-        label.setText(self._honey_entries_heading())
+        label.setText(f"{self._honey_entries_heading()} (prepared runs)")
 
-    def _show_logs_list_context_menu(self, position) -> None:
-        if not hasattr(self, "logs_list"):
+    def _show_logs_list_context_menu(self, source_list: QListWidget | None, position) -> None:
+        if source_list is None:
             return
-        item = self.logs_list.itemAt(position)
+        item = source_list.itemAt(position)
         if item is not None:
-            self.logs_list.setCurrentItem(item)
-        entry = self._entry_from_item(item or self.logs_list.currentItem())
+            source_list.setCurrentItem(item)
+        entry = self._entry_from_item(item or source_list.currentItem())
         menu = QMenu(self)
         open_dir_action = menu.addAction("Open dir with complete log")
         open_dir_action.setEnabled(entry is not None and bool(entry and entry.log_path))
-        action = menu.exec(self.logs_list.viewport().mapToGlobal(position))
+        action = menu.exec(source_list.viewport().mapToGlobal(position))
         if action == open_dir_action:
             self._open_log_directory(entry)
 
-    def _show_log_table_context_menu(self, position) -> None:
+    def _show_log_preview_context_menu(self, position) -> None:
         if not hasattr(self, "log_preview"):
             return
         entry = self._current_log_entry()
@@ -2542,102 +5158,103 @@ class App(QMainWindow):
         if action == open_dir_action:
             self._open_log_directory(entry)
 
-    def _handle_logs_selection_change(self, current: QListWidgetItem | None, previous: QListWidgetItem | None) -> None:
+    def _handle_logs_selection_change(
+        self,
+        current: QListWidgetItem | None,
+        previous: QListWidgetItem | None,
+    ) -> None:
         self.update_log_detail_from_selection(current, previous)
         entry = self._entry_from_item(current)
         entry_id = entry.entry_id if entry else None
         self._sync_selection_to_entry(self.honey_list, entry_id)
         if hasattr(self, "delete_log_button"):
             self.delete_log_button.setEnabled(entry is not None)
+        self._update_prepare_button_state(entry)
 
     def _handle_honey_selection_change(self, current: QListWidgetItem | None, _: QListWidgetItem | None) -> None:
         self._update_honey_buttons()
         entry = self._entry_from_item(current)
         entry_id = entry.entry_id if entry else None
-        self._sync_selection_to_entry(self.logs_list, entry_id)
+        self._sync_log_lists_to_entry(entry_id)
         self._update_honey_detail(entry)
         self._update_honey_entries_label()
 
     def _refresh_log_preview_only(self) -> None:
+        entry = self._current_log_entry()
         if self._cached_log_lines:
-            self._render_log_table()
+            self._display_cached_log_lines()
             self._update_log_preview_status(
                 self._cached_log_truncated,
                 self._cached_log_path,
                 len(self._cached_log_lines),
+                processed=self._cached_preview_processed,
+                segments=self._cached_preview_segment_count,
             )
             return
-        entry = self._entry_from_item(self.logs_list.currentItem())
         self._update_log_preview(entry)
 
     def _update_log_preview(self, entry: RunEntry | None) -> None:
         if not hasattr(self, "log_preview"):
             return
+        self._cancel_active_preview_job()
+        self._cancel_active_segment_job()
+        self._preview_live_lines = []
+        self._preview_view_has_content = False
+        self._preview_context = None
+        self._preview_progress = {}
+        self._cached_log_lines = []
+        self._cached_log_truncated = False
+        self._cached_preview_processed = False
+        self._cached_preview_segment_count = 0
+        if hasattr(self, "log_preview"):
+            self.log_preview.clear()
         if hasattr(self, "delete_log_button"):
             self.delete_log_button.setEnabled(entry is not None)
+        self._update_prepare_button_state(entry)
         if entry and entry.binary_path:
             binary_name = Path(entry.binary_path).name or entry.binary_path
             self.logs_exec_label.setText(f"Execution Logs for: {binary_name}")
         else:
             self.logs_exec_label.setText("Execution Logs for: None")
-        if entry and entry.log_path:
-            path = Path(entry.log_path)
-            self.log_preview_label.setText("Instruction Trace")
-            need_reload = (
-                entry.entry_id != self._cached_log_entry_id
-                or path != self._cached_log_path
-                or not self._cached_log_lines
-            )
-            if need_reload:
-                if not path.exists():
-                    self.log_preview.clear()
-                    self._cached_log_lines = []
-                    self._cached_log_entry_id = entry.entry_id
-                    self._cached_log_path = path
-                    self._cached_log_truncated = False
-                    self._update_log_preview_status(False, path, 0)
-                    return
-                try:
-                    lines, truncated = self._stream_log_lines(path, self._log_preview_max_chars)
-                except OSError as exc:
-                    self.log_preview.clear()
-                    self._cached_log_lines = []
-                    self._cached_log_entry_id = entry.entry_id
-                    self._cached_log_path = path
-                    self._cached_log_truncated = False
-                    self._update_log_preview_status(False, path, 0)
-                    self.log_preview_status.setText(f"Unable to read instruction log: {exc}")
-                    return
-                self._cached_log_lines = lines
-                self._cached_log_truncated = truncated
-                self._cached_log_path = path
-                self._cached_log_entry_id = entry.entry_id
-                self._explicit_removed_columns.clear()
-                self._column_offset_adjustments.clear()
-                self._current_sort = None
-                self._reset_action_history()
-            self._render_log_table()
-            self._update_log_preview_status(
-                self._cached_log_truncated,
-                self._cached_log_path,
-                len(self._cached_log_lines),
-            )
-        else:
-            self.log_preview_label.setText("Instruction Trace")
-            self._cached_log_lines = []
+        self.log_preview_label.setText("Instruction Trace")
+        self._update_segments_view(entry)
+        if not entry or not entry.log_path:
             self._cached_log_entry_id = None
             self._cached_log_path = None
-            self._cached_log_truncated = False
-            self._explicit_removed_columns.clear()
-            self._column_offset_adjustments.clear()
-            self._current_sort = None
-            self._current_column_mapping = []
-            self.log_preview.clear()
-            self.log_preview.setRowCount(0)
-            self.log_preview.setColumnCount(0)
-            self._update_log_preview_status(False, None, 0)
-            self._reset_action_history()
-            self._refresh_transform_controls()
+            self._update_log_preview_status(False, None, 0, processed=False)
+            return
+        path = Path(entry.log_path)
+        if not path.exists():
+            self._cached_log_entry_id = entry.entry_id
+            self._cached_log_path = path
+            self._update_log_preview_status(False, path, 0, processed=False)
+            return
+        segments = self._entry_segments(entry)
+        self._cached_log_entry_id = entry.entry_id
+        self._cached_log_path = path
+        if segments:
+            self._cached_preview_processed = True
+            self._cached_preview_segment_count = len(segments)
+            self._update_log_preview_status(False, path, 0, processed=True, segments=len(segments))
+            table = getattr(self, "log_segments_table", None)
+            if table is not None and table.rowCount() > 0:
+                if (
+                    self._active_segment_entry_id != entry.entry_id
+                    or self._active_segment_row is None
+                    or self._active_segment_row >= len(segments)
+                    or self._active_segment_row < 0
+                ):
+                    table.selectRow(0)
+                else:
+                    self._load_segment_preview(entry, path, self._active_segment_row)
+            else:
+                self.log_preview.clear()
+            return
+        cache_key = self._preview_cache_key(entry, processed=False, segments=segments, path=path)
+        if cache_key in self._preview_cache:
+            self._apply_cached_preview(self._preview_cache[cache_key])
+            return
+        self._begin_preview_loading(entry, path, segments, False, cache_key)
 
     def _stream_log_lines(self, path: Path, max_chars: int) -> tuple[list[str], bool]:
         lines: list[str] = []
@@ -2667,639 +5284,22 @@ class App(QMainWindow):
             raise RuntimeError(f"Unable to read log at {path}: {exc}") from exc
         return lines, truncated
 
-    def _render_log_table(self) -> None:
-        if not hasattr(self, "log_preview"):
+    def _display_cached_log_lines(self) -> None:
+        viewer = getattr(self, "log_preview", None)
+        if viewer is None:
             return
-        table = self.log_preview
-        lines = getattr(self, "_cached_log_lines", [])
-        if not lines:
-            table.clear()
-            table.setRowCount(0)
-            table.setColumnCount(0)
-            self._current_column_mapping = []
-            self._refresh_transform_controls()
-            return
+        content = "\n".join(self._cached_log_lines)
+        viewer.setPlainText(content)
 
-        delimiter = self._effective_delimiter()
-        remove_columns = set(self._explicit_removed_columns)
-
-        raw_rows: list[list[str]] = []
-        max_cols = 0
-        for line in lines:
-            columns = self._split_columns(line, delimiter)
-            raw_rows.append(columns)
-            if len(columns) > max_cols:
-                max_cols = len(columns)
-
-        if max_cols == 0:
-            table.clear()
-            table.setRowCount(0)
-            table.setColumnCount(0)
-            self._current_column_mapping = []
-            self._refresh_transform_controls()
-            return
-
-        display_columns = [idx for idx in range(1, max_cols + 1) if idx not in remove_columns]
-        if not display_columns:
-            table.clear()
-            table.setRowCount(0)
-            table.setColumnCount(0)
-            self._current_column_mapping = []
-            self._refresh_transform_controls()
-            return
-
-        processed_rows: list[list[str]] = []
-        for columns in raw_rows:
-            adjusted = self._apply_offsets_to_row(columns)
-            display_row: list[str] = []
-            for original_index in display_columns:
-                value = adjusted[original_index - 1] if original_index - 1 < len(adjusted) else ""
-                display_row.append(value)
-            processed_rows.append(display_row)
-
-        sort_position: int | None = None
-        if self._current_sort:
-            try:
-                sort_position = display_columns.index(self._current_sort[0])
-            except ValueError:
-                sort_position = None
-
-        if sort_position is not None and processed_rows:
-            ascending = self._current_sort[1]
-            processed_rows.sort(
-                key=lambda row: self._sort_key_for_value(row[sort_position]),
-                reverse=not ascending,
-            )
-
-        self._current_column_mapping = display_columns
-        table.setRowCount(len(processed_rows))
-        table.setColumnCount(len(display_columns))
-        header_labels = [f"Col {idx}" for idx in display_columns]
-        table.setHorizontalHeaderLabels(header_labels)
-
-        for row_idx, display_row in enumerate(processed_rows):
-            for col_pos, value in enumerate(display_row):
-                item = QTableWidgetItem(value)
-                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
-                table.setItem(row_idx, col_pos, item)
-        table.resizeColumnsToContents()
-        self._refresh_transform_controls()
-
-    def _refresh_transform_controls(self) -> None:
-        if not hasattr(self, "apply_actions_button"):
-            return
-        has_columns = bool(self._current_column_mapping)
-        self.apply_actions_button.setEnabled(has_columns)
-        if hasattr(self, "reset_columns_button"):
-            self.reset_columns_button.setEnabled(has_columns and bool(self._explicit_removed_columns))
-
-    def _selected_column_indices(self) -> list[int]:
-        table = getattr(self, "log_preview", None)
-        if table is None or not self._current_column_mapping:
-            return []
-        selection_model = table.selectionModel()
-        if selection_model is None:
-            return []
-        selected_columns = selection_model.selectedColumns()
-        if selected_columns:
-            columns = {index.column() for index in selected_columns}
-        else:
-            columns = {index.column() for index in selection_model.selectedIndexes()}
-        original_indices: list[int] = []
-        for col in sorted(columns):
-            if 0 <= col < len(self._current_column_mapping):
-                original_indices.append(self._current_column_mapping[col])
-        return original_indices
-
-    def _remove_columns_batch(self, original_indices: list[int]) -> None:
-        new_indices = [idx for idx in original_indices if idx not in self._explicit_removed_columns]
-        if not new_indices:
-            return
-        self._explicit_removed_columns.update(new_indices)
-        if len(new_indices) == 1:
-            self._record_action(f"Removed column {new_indices[0]}")
-        else:
-            joined = ", ".join(str(idx) for idx in sorted(new_indices))
-            self._record_action(f"Removed columns {joined}")
-        self._render_log_table()
-        self._update_log_preview_status(
-            self._cached_log_truncated,
-            self._cached_log_path,
-            len(self._cached_log_lines),
-        )
-
-    def _record_action(self, description: str) -> None:
-        self._action_history.append(description)
-        self._update_log_actions_indicator()
-        self._refresh_transform_controls()
-
-    def _reset_action_history(self) -> None:
-        self._action_history.clear()
-        self._update_log_actions_indicator()
-        self._refresh_transform_controls()
-
-    def _reload_current_log_preview(self) -> None:
-        current_entry = self._entry_from_item(self.logs_list.currentItem()) if hasattr(self, "logs_list") else None
-        self._update_log_preview(current_entry)
-
-    def _show_header_context_menu(self, position):
-        if not self._current_column_mapping:
-            return
-        header = self.log_preview.horizontalHeader()
-        logical_index = header.logicalIndexAt(position)
-        if logical_index < 0 or logical_index >= len(self._current_column_mapping):
-            return
-        original_idx = self._current_column_mapping[logical_index]
-        selected_indices = self._selected_column_indices()
-        if not selected_indices or original_idx not in selected_indices:
-            selected_indices = [original_idx]
-        menu = QMenu(self)
-        remove_selected_action = menu.addAction(
-            f"Remove Selected Columns ({len(selected_indices)})"
-        )
-        apply_offset_action = menu.addAction("Apply Offset…")
-        clear_offset_action = None
-        if original_idx in self._column_offset_adjustments:
-            clear_offset_action = menu.addAction("Clear Offset")
-        menu.addSeparator()
-        sort_asc_action = menu.addAction("Sort Ascending")
-        sort_desc_action = menu.addAction("Sort Descending")
-        clear_sort_action = None
-        if self._current_sort is not None:
-            clear_sort_action = menu.addAction("Clear Sort")
-        menu.addSeparator()
-        clear_offsets_action = None
-        if self._column_offset_adjustments:
-            clear_offsets_action = menu.addAction("Clear All Offsets")
-
-        action = menu.exec(header.mapToGlobal(position))
-        if action is None:
-            return
-        if action == remove_selected_action:
-            self._remove_columns_batch(selected_indices)
-        elif action == apply_offset_action:
-            self._apply_offset_for_column(original_idx)
-        elif clear_offset_action and action == clear_offset_action:
-            self._clear_offset_for_column(original_idx)
-        elif action == sort_asc_action:
-            self._apply_sort_for_column(original_idx, True)
-        elif action == sort_desc_action:
-            self._apply_sort_for_column(original_idx, False)
-        elif clear_sort_action and action == clear_sort_action:
-            self._clear_sort_transform()
-        elif clear_offsets_action and action == clear_offsets_action:
-            self._clear_offsets()
-
-    def _apply_offset_for_column(self, original_idx: int) -> None:
-        prompt = f"Hex delta for Col {original_idx} (e.g., 0x100 or -0x20):"
-        value, ok = QInputDialog.getText(self, "Apply Offset", prompt)
-        if not ok or not value.strip():
-            return
-        try:
-            delta = self._parse_offset_delta(value.strip())
-        except ValueError as exc:
-            QMessageBox.warning(self, "Invalid offset", str(exc))
-            return
-        self._column_offset_adjustments[original_idx] = delta
-        self._record_action(f"Offset column {original_idx} by {value.strip()}")
-        self._render_log_table()
-
-    def _clear_offset_for_column(self, original_idx: int) -> None:
-        if original_idx not in self._column_offset_adjustments:
-            return
-        self._column_offset_adjustments.pop(original_idx, None)
-        self._record_action(f"Cleared offset for column {original_idx}")
-        self._render_log_table()
-
-    def _clear_offsets(self) -> None:
-        if not self._column_offset_adjustments:
-            return
-        self._column_offset_adjustments.clear()
-        self._record_action("Cleared all offsets")
-        self._render_log_table()
-
-    def _apply_sort_for_column(self, original_idx: int, ascending: bool) -> None:
-        self._current_sort = (original_idx, ascending)
-        direction = "ascending" if ascending else "descending"
-        self._record_action(f"Sorted column {original_idx} {direction}")
-        self._render_log_table()
-
-    def _clear_sort_transform(self) -> None:
-        if not self._current_sort:
-            return
-        self._current_sort = None
-        self._record_action("Cleared sort")
-        self._render_log_table()
-
-    def _reset_removed_columns(self) -> None:
-        if not self._explicit_removed_columns:
-            return
-        self._explicit_removed_columns.clear()
-        self._record_action("Reset columns")
-        self._render_log_table()
-        self._update_log_preview_status(
-            self._cached_log_truncated,
-            self._cached_log_path,
-            len(self._cached_log_lines),
-        )
-
-    def _has_active_transforms(self) -> bool:
-        return bool(self._explicit_removed_columns or self._column_offset_adjustments or self._current_sort)
-
-    def _export_current_log(
+    def _update_log_preview_status(
         self,
-        destination: Path,
+        truncated: bool,
+        path: Path | None,
+        line_count: int,
         *,
-        overwrite_source: bool,
-        remove_duplicates: bool = False,
-        sort_override: tuple[int, bool] | None = None,
-        force_uniform: bool = False,
-    ) -> tuple[bool, Path | None, int]:
-        if not self._cached_log_path:
-            return False
-        source_path = self._cached_log_path
-        delimiter = self._effective_delimiter()
-        removed = set(self._explicit_removed_columns)
-        offsets = dict(self._column_offset_adjustments)
-        sort_spec = sort_override if sort_override is not None else self._current_sort
-        deduplicate = remove_duplicates
-        joiner = delimiter if delimiter and delimiter != " " else " "
-        if not source_path.exists():
-            QMessageBox.warning(self, "Missing file", f"Instruction log not found: {source_path}")
-            return False, None, 0
-        try:
-            total_bytes = max(source_path.stat().st_size, 1)
-        except OSError as exc:
-            QMessageBox.critical(self, "Unable to read", f"Failed to inspect log file: {exc}")
-            return False, None, 0
-
-        if force_uniform and len(self._current_column_mapping) != 1:
-            force_uniform = False
-
-        uniform_target: int | None = None
-        if force_uniform:
-            uniform_target = self._determine_uniform_length(source_path, delimiter, offsets, removed, joiner)
-            if uniform_target is None:
-                QMessageBox.information(self, "No data", "No rows available to enforce uniformity.")
-                return False, None, 0
-
-        rejected_path: Path | None = None
-        rejected_count = 0
-
-        action_label = "Applying fixes to log..." if overwrite_source else "Saving ready file..."
-        progress_dialog = QProgressDialog(action_label, None, 0, 100, self)
-        progress_dialog.setCancelButton(None)
-        progress_dialog.setMinimumDuration(0)
-        progress_dialog.setWindowTitle("Processing Log")
-        progress_dialog.setWindowModality(Qt.ApplicationModal)
-        progress_dialog.setValue(0)
-        progress_dialog.show()
-
-        temp_target = (
-            source_path.with_suffix(source_path.suffix + ".tmp")
-            if overwrite_source
-            else destination.with_suffix(destination.suffix + ".tmp")
-        )
-        temp_target.parent.mkdir(parents=True, exist_ok=True)
-
-        bytes_processed = 0
-        update_counter = 0
-        need_sort = sort_spec is not None
-        processed_rows: list[tuple[tuple[int, object], int, str]] = []
-        row_counter = 0
-
-        try:
-            with source_path.open("r", encoding="utf-8", errors="replace") as source:
-                if not need_sort:
-                    with temp_target.open("w", encoding="utf-8") as dest:
-                        seen_rows: set[str] = set()
-                        reject_handle = None
-                        for raw_line in source:
-                            line = raw_line.rstrip("\n")
-                            adjusted, row_text = self._process_line(line, delimiter, offsets, removed, joiner)
-                            row_length = len(row_text)
-                            if force_uniform and row_length != uniform_target:
-                                if reject_handle is None:
-                                    rejected_path = destination.with_name(
-                                        f"{destination.stem}_nonuniform{destination.suffix or '.txt'}"
-                                    )
-                                    reject_handle = rejected_path.open("w", encoding="utf-8")
-                                reject_handle.write(row_text + "\n")
-                                rejected_count += 1
-                            else:
-                                if deduplicate:
-                                    if row_text in seen_rows:
-                                        bytes_processed += len(raw_line.encode("utf-8"))
-                                        update_counter += 1
-                                        if update_counter % 200 == 0 or bytes_processed >= total_bytes:
-                                            progress = min(int(bytes_processed * 100 / total_bytes), 100)
-                                            progress_dialog.setValue(progress)
-                                            QApplication.processEvents()
-                                        continue
-                                    seen_rows.add(row_text)
-                                dest.write(row_text + "\n")
-                                row_counter += 1
-                            bytes_processed += len(raw_line.encode("utf-8"))
-                            update_counter += 1
-                            if update_counter % 200 == 0 or bytes_processed >= total_bytes:
-                                progress = min(int(bytes_processed * 100 / total_bytes), 100)
-                                progress_dialog.setValue(progress)
-                                QApplication.processEvents()
-                        if reject_handle:
-                            reject_handle.close()
-                else:
-                    progress_share = 70
-                    sort_column, ascending = sort_spec
-                    for raw_line in source:
-                        line = raw_line.rstrip("\n")
-                        adjusted, row_text = self._process_line(line, delimiter, offsets, removed, joiner)
-                        target_value = adjusted[sort_column - 1] if sort_column - 1 < len(adjusted) else ""
-                        key = self._sort_key_for_value(target_value)
-                        processed_rows.append((key, row_counter, row_text, len(row_text)))
-                        bytes_processed += len(raw_line.encode("utf-8"))
-                        row_counter += 1
-                        update_counter += 1
-                        if update_counter % 200 == 0 or bytes_processed >= total_bytes:
-                            progress = min(int(bytes_processed * progress_share / total_bytes), progress_share)
-                            progress_dialog.setValue(progress)
-                            QApplication.processEvents()
-                    if processed_rows:
-                        progress_dialog.setLabelText("Sorting rows...")
-                        QApplication.processEvents()
-                        processed_rows.sort(key=lambda item: (item[0], item[1]), reverse=not ascending)
-                    if deduplicate:
-                        deduped: list[tuple[tuple[int, object], int, str, int]] = []
-                        seen_rows_sort: set[str] = set()
-                        for entry in processed_rows:
-                            row_text = entry[2]
-                            if row_text in seen_rows_sort:
-                                continue
-                            seen_rows_sort.add(row_text)
-                            deduped.append(entry)
-                        processed_rows = deduped
-                    if force_uniform:
-                        reject_handle = None
-                        kept_rows: list[tuple[tuple[int, object], int, str, int]] = []
-                        for entry in processed_rows:
-                            if entry[3] != uniform_target:
-                                if reject_handle is None:
-                                    rejected_path = destination.with_name(
-                                        f"{destination.stem}_nonuniform{destination.suffix or '.txt'}"
-                                    )
-                                    reject_handle = rejected_path.open("w", encoding="utf-8")
-                                reject_handle.write(entry[2] + "\n")
-                                rejected_count += 1
-                                continue
-                            kept_rows.append(entry)
-                        processed_rows = kept_rows
-                        if reject_handle:
-                            reject_handle.close()
-                    progress_dialog.setLabelText("Writing ready file...")
-                    with temp_target.open("w", encoding="utf-8") as dest:
-                        total_rows = max(len(processed_rows), 1)
-                        for idx, (_, _, row_text, _) in enumerate(processed_rows, start=1):
-                            dest.write(row_text + "\n")
-                            if idx % 1000 == 0 or idx == total_rows:
-                                base = 85
-                                progress = base + int(idx * 15 / total_rows)
-                                progress_dialog.setValue(min(progress, 100))
-                                QApplication.processEvents()
-            target_path = source_path if overwrite_source else destination
-            temp_target.replace(target_path)
-            progress_dialog.setValue(100)
-            if rejected_path and rejected_count == 0 and rejected_path.exists():
-                try:
-                    rejected_path.unlink()
-                    rejected_path = None
-                except OSError:
-                    pass
-            return True, rejected_path, rejected_count
-        except OSError as exc:
-            QMessageBox.critical(self, "Unable to write", f"Failed to write log file: {exc}")
-            if temp_target.exists():
-                try:
-                    temp_target.unlink()
-                except OSError:
-                    pass
-            if rejected_path and rejected_path.exists():
-                try:
-                    rejected_path.unlink()
-                except OSError:
-                    pass
-            return False, None, 0
-        finally:
-            progress_dialog.close()
-
-    def _apply_offsets_to_row(self, columns: list[str], offsets: dict[int, int] | None = None) -> list[str]:
-        if not offsets:
-            return list(columns)
-        result = list(columns)
-        for original_idx, delta in offsets.items():
-            pos = original_idx - 1
-            if 0 <= pos < len(result):
-                new_value = self._offset_value(result[pos], delta)
-                if new_value is not None:
-                    result[pos] = new_value
-        return result
-
-    def _process_line(
-        self,
-        line: str,
-        delimiter: str,
-        offsets: dict[int, int],
-        removed: set[int],
-        joiner: str,
-    ) -> tuple[list[str], str]:
-        columns = self._split_columns(line, delimiter)
-        adjusted = self._apply_offsets_to_row(columns, offsets)
-        filtered = [value for idx, value in enumerate(adjusted, start=1) if idx not in removed]
-        row_text = joiner.join(filtered) if filtered else ""
-        return adjusted, row_text
-
-    def _determine_uniform_length(
-        self,
-        source_path: Path,
-        delimiter: str,
-        offsets: dict[int, int],
-        removed: set[int],
-        joiner: str,
-    ) -> int | None:
-        counts: dict[int, int] = {}
-        try:
-            with source_path.open("r", encoding="utf-8", errors="replace") as source:
-                for raw_line in source:
-                    line = raw_line.rstrip("\n")
-                    _, row_text = self._process_line(line, delimiter, offsets, removed, joiner)
-                    counts[len(row_text)] = counts.get(len(row_text), 0) + 1
-        except OSError:
-            return None
-        if not counts:
-            return None
-        return max(counts.items(), key=lambda item: (item[1], item[0]))[0]
-
-    def _offset_value(self, raw_value: str, delta: int) -> str | None:
-        parsed = self._try_parse_numeric_value(raw_value)
-        if parsed is None:
-            return None
-        updated = parsed + delta
-        return self._format_numeric_value(raw_value, updated)
-
-    def _parse_offset_delta(self, text: str) -> int:
-        cleaned = text.strip()
-        if not cleaned:
-            raise ValueError("Offset cannot be empty.")
-        if cleaned.lower().startswith("0x") or cleaned.lower().startswith("-0x") or cleaned.lower().startswith("+0x"):
-            return int(cleaned, 16)
-        try:
-            return int(cleaned, 16)
-        except ValueError as exc:
-            raise ValueError("Offsets must be hexadecimal values (e.g., 0x40 or -0x10).") from exc
-
-    def _try_parse_numeric_value(self, value: str) -> int | None:
-        stripped = value.strip()
-        if not stripped:
-            return None
-        sign = 1
-        if stripped[0] in "+-":
-            sign = -1 if stripped[0] == "-" else 1
-            stripped = stripped[1:]
-        if not stripped:
-            return None
-        base = 10
-        if stripped.lower().startswith("0x"):
-            base = 16
-            stripped = stripped[2:]
-        elif any(ch in string.hexdigits[10:] for ch in stripped):
-            base = 16
-        if not stripped:
-            return None
-        try:
-            number = int(stripped, base)
-        except ValueError:
-            return None
-        return sign * number
-
-    def _format_numeric_value(self, original: str, value: int) -> str:
-        stripped = original.strip()
-        if not stripped:
-            return str(value)
-        has_sign = stripped[0] in "+-"
-        prefix = stripped[0] if has_sign else ""
-        remainder = stripped[1:] if has_sign else stripped
-        remainder_lower = remainder.lower()
-        negative = value < 0
-        abs_value = abs(value)
-        if remainder_lower.startswith("0x"):
-            formatted = f"0x{abs_value:x}"
-        elif all(ch in string.hexdigits for ch in remainder) and any(ch.isalpha() for ch in remainder):
-            digits = f"{abs_value:x}"
-            if any(ch.isalpha() and ch.isupper() for ch in remainder):
-                digits = digits.upper()
-            formatted = digits
-        else:
-            formatted = str(abs_value)
-        if negative:
-            return "-" + formatted
-        if prefix == "+":
-            return "+" + formatted
-        return formatted
-
-    def _sort_key_for_value(self, value: str) -> tuple[int, object]:
-        numeric = self._try_parse_numeric_value(value)
-        if numeric is not None:
-            return (0, numeric)
-        return (1, value)
-
-    def _persist_column_cuts_to_file(self) -> None:
-        if not self._cached_log_path:
-            QMessageBox.information(self, "No log selected", "Select a log entry before applying changes.")
-            return
-        if not self._current_column_mapping:
-            QMessageBox.warning(self, "No columns", "Nothing to write back. Reset the view and try again.")
-            return
-        options_dialog = ApplyOptionsDialog(self)
-        options_dialog.set_uniform_available(len(self._current_column_mapping) == 1)
-        if options_dialog.exec() != QDialog.Accepted:
-            return
-        options = options_dialog.selected_options()
-        remove_duplicates = bool(options.get("remove_duplicates"))
-        sort_enabled = bool(options.get("sort_enabled"))
-        sort_ascending = bool(options.get("sort_ascending", True))
-        force_uniform = bool(options.get("force_uniform"))
-        sort_override: tuple[int, bool] | None = None
-        if sort_enabled:
-            column_source = self._current_sort[0] if self._current_sort else None
-            if column_source is None and self._current_column_mapping:
-                column_source = self._current_column_mapping[0]
-            if column_source is not None:
-                sort_override = (column_source, sort_ascending)
-            else:
-                QMessageBox.warning(self, "Cannot sort", "No columns available to sort.")
-                return
-        if not self._has_active_transforms():
-            if not remove_duplicates and sort_override is None:
-                QMessageBox.information(
-                    self,
-                    "No changes",
-                    "Select at least one fix (remove columns, offsets, sort, remove duplicates) before applying.",
-                )
-                return
-        path = self._cached_log_path
-        if not path.exists():
-            QMessageBox.warning(self, "Missing file", f"Instruction log not found: {path}")
-            return
-        confirm = QMessageBox.question(
-            self,
-            "Apply column removal",
-            "This will overwrite the log file with the current fixes applied. Continue?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
-        )
-        if confirm != QMessageBox.Yes:
-            return
-        success, rejected_path, rejected_rows = self._export_current_log(
-            path,
-            overwrite_source=True,
-            remove_duplicates=remove_duplicates,
-            sort_override=sort_override,
-            force_uniform=force_uniform,
-        )
-        if success:
-            self._append_console(f"Applied fixes to log: {path}")
-            self._explicit_removed_columns.clear()
-            self._column_offset_adjustments.clear()
-            self._current_sort = None
-            self._cached_log_lines = []
-            self._cached_log_entry_id = None
-            self._cached_log_path = None
-            self._cached_log_truncated = False
-            self._reload_current_log_preview()
-            self._reset_action_history()
-            if rejected_rows and rejected_path:
-                self._append_console(
-                    f"Force uniformity removed {rejected_rows} rows. Saved to: {rejected_path}"
-                )
-                QMessageBox.information(
-                    self,
-                    "Rows removed",
-                    f"{rejected_rows} rows did not match the majority length and were saved to:\n{rejected_path}",
-                )
-
-    def _effective_delimiter(self) -> str:
-        if hasattr(self, "log_delimiter_input"):
-            raw = self.log_delimiter_input.text()
-            if raw:
-                stripped = raw.rstrip("\n")
-                return stripped if stripped.strip() else " "
-        return " "
-
-    def _split_columns(self, line: str, delimiter: str) -> list[str]:
-        if not delimiter or delimiter == " ":
-            return line.split()
-        return line.split(delimiter)
-
-
-    def _update_log_preview_status(self, truncated: bool, path: Path | None, line_count: int) -> None:
+        processed: bool = False,
+        segments: int = 0,
+    ) -> None:
         if not hasattr(self, "log_preview_status"):
             return
         if path is None:
@@ -3307,6 +5307,12 @@ class App(QMainWindow):
             return
         if not path.exists():
             self.log_preview_status.setText(f"Instruction log not found: {path}")
+            return
+        if processed and segments:
+            suffix = "segment" if segments == 1 else "segments"
+            self.log_preview_status.setText(
+                f"Select one of {segments} {suffix} to view the first and last {SEGMENT_EDGE_PREVIEW_LIMIT} instruction(s) in {path.name}."
+            )
             return
         if truncated:
             approx_kb = max(self._log_preview_max_chars // 1024, 1)
@@ -3318,6 +5324,135 @@ class App(QMainWindow):
                 self.log_preview_status.setText("Log file empty.")
             else:
                 self.log_preview_status.setText(f"Showing {line_count} lines from {path.name}.")
+
+    def _update_segments_view(self, entry: RunEntry | None) -> None:
+        table = getattr(self, "log_segments_table", None)
+        label = getattr(self, "log_segments_label", None)
+        if table is None or label is None:
+            return
+        current_entry_id = entry.entry_id if entry else None
+        if current_entry_id != self._active_segment_entry_id:
+            self._active_segment_row = None
+            self._active_segment_entry_id = current_entry_id
+        segments = self._entry_segments(entry)
+        if not segments:
+            self._segment_selection_updating = True
+            try:
+                table.setRowCount(0)
+                table.clearSelection()
+            finally:
+                self._segment_selection_updating = False
+            table.hide()
+            label.hide()
+            self._segment_preview_context = None
+            return
+        table.setRowCount(len(segments))
+        for row, (start, end) in enumerate(segments):
+            index_item = QTableWidgetItem(str(row + 1))
+            start_item = QTableWidgetItem(f"0x{start:x}")
+            end_item = QTableWidgetItem(f"0x{end:x}")
+            length_value = max((end - start) + 1, 1)
+            length_item = QTableWidgetItem(f"{length_value:,}")
+            length_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            table.setItem(row, 0, index_item)
+            table.setItem(row, 1, start_item)
+            table.setItem(row, 2, end_item)
+            table.setItem(row, 3, length_item)
+        label.show()
+        table.show()
+
+    def _handle_segment_selection_changed(self) -> None:
+        if self._segment_selection_updating:
+            return
+        table = getattr(self, "log_segments_table", None)
+        if table is None or table.selectionModel() is None:
+            return
+        selection = table.selectionModel().selectedRows()
+        if not selection:
+            self._active_segment_row = None
+            return
+        row = selection[0].row()
+        entry = self._current_log_entry()
+        if entry is None or not entry.log_path:
+            self._active_segment_row = None
+            return
+        self._active_segment_entry_id = entry.entry_id
+        self._active_segment_row = row
+        path = Path(entry.log_path)
+        self._load_segment_preview(entry, path, row)
+
+    def _segment_preview_cache_key(self, entry: RunEntry, row: int, path: Path) -> tuple[str, int, float]:
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        return (entry.entry_id, row, mtime)
+
+    def _load_segment_preview(self, entry: RunEntry, path: Path, row: int) -> None:
+        viewer = getattr(self, "log_preview", None)
+        status_label = getattr(self, "log_preview_status", None)
+        label = getattr(self, "log_preview_label", None)
+        if viewer is None or status_label is None or label is None:
+            return
+        if not path.exists():
+            viewer.clear()
+            status_label.setText(f"Instruction log not found: {path}")
+            return
+        segments = self._entry_segments(entry)
+        if not segments or row < 0 or row >= len(segments):
+            viewer.clear()
+            status_label.setText("Select a segment to view its instructions.")
+            return
+        start, end = segments[row]
+        label.setText(f"Segment {row + 1}: 0x{start:x} - 0x{end:x}")
+        cache_key = self._segment_preview_cache_key(entry, row, path)
+        cache_entry = self._segment_preview_cache.get(cache_key)
+        if cache_entry:
+            lines = list(cache_entry.get("lines", []))
+            total = int(cache_entry.get("total", 0) or 0)
+            truncated = bool(cache_entry.get("truncated", False))
+            self._apply_segment_preview_lines(
+                entry=entry,
+                path=path,
+                row=row,
+                start=start,
+                end=end,
+                lines=lines,
+                total=total,
+                truncated=truncated,
+            )
+            return
+        self._begin_segment_preview_job(entry, path, row, start, end, cache_key)
+
+    def _cancel_sanitization_preview(self) -> None:
+        if self._sanitization_preview_worker:
+            self._sanitization_preview_worker.cancel()
+
+    def _cleanup_sanitization_preview_worker(self, *, wait: bool = True) -> None:
+        # Ensure dialog/thread cleanup always runs on the GUI thread to avoid Qt warnings
+        if QThread.currentThread() is not self.thread():
+            self._gui_invoker.invoke.emit(lambda wait_flag=wait: self._cleanup_sanitization_preview_worker(wait=wait_flag))
+            return
+        dialog = self._sanitization_preview_dialog
+        if dialog is not None:
+            dialog.blockSignals(True)
+            dialog.hide()
+            dialog.close()
+            dialog.deleteLater()
+            self._sanitization_preview_dialog = None
+        thread = self._sanitization_preview_thread
+        worker = self._sanitization_preview_worker
+        if worker is not None:
+            worker.deleteLater()
+        if thread is not None:
+            if thread.isRunning() and thread is not QThread.currentThread():
+                thread.requestInterruption()
+                thread.quit()
+                if wait:
+                    thread.wait()
+            thread.deleteLater()
+        self._sanitization_preview_thread = None
+        self._sanitization_preview_worker = None
 
     def _sync_selection_to_entry(self, target_list: QListWidget, entry_id: str | None) -> None:
         if self._selection_syncing:
@@ -3334,6 +5469,192 @@ class App(QMainWindow):
                     break
         finally:
             self._selection_syncing = False
+
+    def preview_sanitization(self) -> None:
+        if self._has_active_sanitization():
+            QMessageBox.information(
+                self,
+                "Sanitization in progress",
+                "Please wait for the current sanitization job to finish before previewing instructions.",
+            )
+            return
+        entry = self._current_honey_entry()
+        if not entry:
+            QMessageBox.information(self, "No entry selected", "Select a HoneyProc entry to preview.")
+            return
+        if not entry.is_sanitized_run and not self._entry_prepared(entry):
+            QMessageBox.information(
+                self,
+                "Preparation required",
+                "Run 'Prepare for HoneyProc' from the Logs tab before previewing this entry.",
+            )
+            return
+        log_path_value = self._entry_field(entry, "log_path")
+        if not log_path_value:
+            QMessageBox.warning(self, "Missing log", "This entry does not have an instruction log to analyze.")
+            return
+        log_path = Path(log_path_value)
+        if not log_path.exists():
+            QMessageBox.warning(
+                self,
+                "Log not found",
+                f"The instruction log could not be found at {log_path}. Re-run the entry to regenerate it.",
+            )
+            return
+        binary_path_value = self._entry_field(entry, "binary_path")
+        if not binary_path_value:
+            QMessageBox.warning(self, "Missing binary", "This entry is missing its binary path.")
+            return
+        binary_path = Path(binary_path_value)
+        if not binary_path.exists():
+            QMessageBox.warning(
+                self,
+                "Binary not found",
+                f"The binary referenced by this entry was not found at {binary_path}.",
+            )
+            return
+        if self._sanitization_preview_thread is not None:
+            QMessageBox.information(
+                self,
+                "Preview already running",
+                "Please wait for the current preview to finish before starting another.",
+            )
+            return
+
+        preview_segments = self._entry_segments(entry)
+        progress_dialog = QProgressDialog("Collecting instruction addresses...\nThis may take a while.", "Cancel", 0, 0, self)
+        progress_dialog.setWindowTitle("Preparing Preview")
+        progress_dialog.setWindowModality(Qt.ApplicationModal)
+        progress_dialog.setMinimumDuration(0)
+        progress_dialog.setAutoClose(False)
+        progress_dialog.setAutoReset(False)
+        progress_dialog.setValue(0)
+        progress_dialog.setLabelText(
+            "Collecting instruction addresses for preview.\nThis may take a while; use Cancel to stop."
+        )
+        progress_dialog.resize(600, 240)
+        progress_dialog.canceled.connect(self._cancel_sanitization_preview)
+        progress_dialog.show()
+        QApplication.processEvents()
+
+        worker = SanitizationPreviewWorker(
+            log_path,
+            binary_path,
+            address_limit=SANITIZATION_PREVIEW_ADDRESS_LIMIT,
+        )
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        self._sanitization_preview_thread = thread
+        self._sanitization_preview_worker = worker
+        self._sanitization_preview_dialog = progress_dialog
+
+        last_progress_update = 0.0
+
+        def _invoke_on_gui(callback: Callable[[], None]) -> None:
+            if QThread.currentThread() is self.thread():
+                callback()
+            else:
+                self._gui_invoker.invoke.emit(callback)
+
+        def _update_progress_dialog(processed: int, total: int) -> None:
+            dialog = self._sanitization_preview_dialog
+            if dialog is None:
+                return
+            if total <= 0:
+                dialog.setRange(0, 0)
+                dialog.setLabelText(
+                    "Collecting instruction addresses for preview.\nThis may take a while; use Cancel to stop."
+                )
+                return
+            dialog.setUpdatesEnabled(False)
+            try:
+                if dialog.maximum() != total:
+                    dialog.setRange(0, total)
+                dialog.setValue(processed)
+                dialog.setLabelText(
+                    f"Disassembling preview instructions ({processed}/{total}).\n"
+                    "Processing the entire log may take a while; use Cancel to stop."
+                )
+            finally:
+                dialog.setUpdatesEnabled(True)
+
+        def _handle_progress(processed: int, total: int) -> None:
+            nonlocal last_progress_update
+            now = time.monotonic()
+            if processed < total and (now - last_progress_update) < 0.05:
+                return
+            last_progress_update = now
+            _invoke_on_gui(lambda proc=processed, tot=total: _update_progress_dialog(proc, tot))
+
+        def _finalize_preview() -> None:
+            self._cleanup_sanitization_preview_worker()
+
+        def _handle_info(message: str) -> None:
+            def _run() -> None:
+                _finalize_preview()
+                QMessageBox.information(self, "Preview unavailable", message)
+
+            _invoke_on_gui(_run)
+
+        def _handle_failed(message: str) -> None:
+            def _run() -> None:
+                _finalize_preview()
+                QMessageBox.critical(self, "Unable to prepare preview", message)
+
+            _invoke_on_gui(_run)
+
+        def _handle_cancelled() -> None:
+            def _run() -> None:
+                _finalize_preview()
+                QMessageBox.information(self, "Preview cancelled", "Instruction preview was cancelled.")
+
+            _invoke_on_gui(_run)
+
+        def _handle_succeeded(payload: object) -> None:
+            def _run() -> None:
+                _finalize_preview()
+                if not isinstance(payload, dict):
+                    QMessageBox.critical(
+                        self,
+                        "Unable to prepare preview",
+                        "Unexpected preview payload format.",
+                    )
+                    return
+                combined_rows = list(payload.get("rows", []))
+                if not combined_rows:
+                    QMessageBox.information(
+                        self,
+                        "Preview unavailable",
+                        "No instructions were returned for preview.",
+                    )
+                    return
+                if payload.get("truncated") and payload.get("limit"):
+                    limit_value = payload["limit"]
+                    QMessageBox.information(
+                        self,
+                        "Preview truncated",
+                        f"Showing the first {limit_value} unique instruction address(es).",
+                    )
+                entry_name = self._entry_field(entry, "name") or self._entry_field(entry, "label") or "Log Preview"
+                label = Path(binary_path).name if binary_path_value else entry_name
+                dialog = InstructionPreviewDialog(
+                    self,
+                    label,
+                    combined_rows,
+                    segments=preview_segments,
+                    binary_path=binary_path,
+                )
+                dialog.exec()
+
+            _invoke_on_gui(_run)
+
+        worker.progress.connect(_handle_progress, Qt.QueuedConnection)
+        worker.info.connect(_handle_info, Qt.QueuedConnection)
+        worker.failed.connect(_handle_failed, Qt.QueuedConnection)
+        worker.cancelled.connect(_handle_cancelled, Qt.QueuedConnection)
+        worker.succeeded.connect(_handle_succeeded, Qt.QueuedConnection)
+        thread.started.connect(worker.run)
+        thread.start()
 
     def sanitize_honey_entry(self) -> None:
         if self._has_active_sanitization():
@@ -3552,18 +5873,26 @@ class App(QMainWindow):
             self._update_honey_buttons()
             return
 
-        run_label = f"{entry.name} (Sanitized)"
-        log_path = str(self._project_log_path(run_label=run_label))
+        default_label = f"{entry.name} (Sanitized)"
+        dialog_result = self._prompt_module_selection(
+            str(path_obj),
+            default_log_label=default_label,
+        )
+        if dialog_result is None:
+            return
+        module_filters, log_label = dialog_result
+        log_path = str(self._project_log_path(run_label=log_label))
         self._run_with_progress(
             str(path_obj),
             log_path,
             record_entry=True,
             entry_to_refresh=None,
-            dialog_label=run_label,
-            run_label=run_label,
+            dialog_label=log_label,
+            run_label=log_label,
             parent_entry_id=entry.entry_id,
             sanitized_binary_path=str(path_obj),
             is_sanitized_run=True,
+            module_filters=module_filters,
         )
 
     def reveal_sanitized_binary(self) -> None:
@@ -3664,6 +5993,55 @@ class App(QMainWindow):
         timestamp = datetime.now().strftime("%H:%M:%S")
         self.console_output.appendPlainText(f"[{timestamp}] {message}")
 
+    def _discover_binary_modules(self, binary_path: str) -> list[str]:
+        modules: list[str] = []
+        name = Path(binary_path).name
+        if name:
+            modules.append(name)
+        try:
+            binary = lief.parse(str(binary_path))
+            libraries = sorted({Path(lib).name or lib for lib in getattr(binary, "libraries", []) if lib})
+            for lib in libraries:
+                if lib not in modules:
+                    modules.append(lib)
+        except Exception:
+            pass
+        return modules
+
+    def _prompt_module_selection(
+        self,
+        binary_path: str,
+        *,
+        default_log_label: str | None = None,
+    ) -> tuple[list[str], str] | None:
+        modules = self._discover_binary_modules(binary_path)
+        default_label = default_log_label or self._default_run_label(binary_path)
+        builder = lambda value: str(self._project_log_path(run_label=(value.strip() or None)))
+        display_name = Path(binary_path).name or str(binary_path)
+        dialog = ModuleSelectionDialog(
+            self,
+            display_name,
+            modules,
+            default_log_label=default_label,
+            filename_builder=builder,
+            previous_selection=self._last_module_filters,
+        )
+        result = dialog.exec()
+        if result != QDialog.Accepted:
+            self._append_console("Run cancelled before launch.")
+            return None
+        selection = dialog.selected_modules()
+        log_label = dialog.selected_log_label()
+        if not selection or not log_label:
+            return None
+        self._last_module_filters = selection
+        return selection, log_label
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        self._cancel_sanitization_preview()
+        self._cleanup_sanitization_preview_worker()
+        super().closeEvent(event)
+
     def _cleanup_sanitize_worker(self) -> None:
         thread = self._current_sanitize_thread
         worker = self._current_sanitize_worker
@@ -3692,37 +6070,10 @@ class App(QMainWindow):
         dialog.setWindowModality(Qt.NonModal)
         dialog.setMinimumDuration(0)
         dialog.setLabelText(message)
+        dialog.resize(460, 180)
         dialog.show()
         QApplication.processEvents()
         return dialog
-
-    def _update_log_actions_indicator(self) -> None:
-        indicator = getattr(self, "log_actions_indicator", None)
-        if indicator is None:
-            return
-        count = len(self._action_history)
-        indicator.setText(f"Fix Actions: {count}")
-        indicator.setEnabled(count > 0)
-        tooltip = "Click to view fix actions" if count else "No fix actions recorded yet."
-        indicator.setToolTip(tooltip)
-
-    def _show_log_actions_popup(self) -> None:
-        if not self._action_history:
-            QMessageBox.information(self, "Fix Actions", "No fix actions recorded yet.")
-            return
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Fix Actions")
-        layout = QVBoxLayout(dialog)
-        list_widget = QListWidget(dialog)
-        for idx, action in enumerate(self._action_history, start=1):
-            list_widget.addItem(f"{idx}. {action}")
-        list_widget.setSelectionMode(QAbstractItemView.NoSelection)
-        layout.addWidget(list_widget)
-        buttons = QDialogButtonBox(QDialogButtonBox.Close, dialog)
-        buttons.rejected.connect(dialog.reject)
-        layout.addWidget(buttons)
-        dialog.resize(420, 280)
-        dialog.exec()
 
     def _handle_sanitize_success(self, result: SanitizationResult) -> None:
         dialog = self._current_sanitize_dialog
@@ -3799,13 +6150,24 @@ class App(QMainWindow):
         if hasattr(self, "build_tool_button"):
             self.build_tool_button.setEnabled(True)
 
-    def _run_and_record(self, binary_path: str, log_path: str | None) -> None:
+    def _run_and_record(
+        self,
+        binary_path: str,
+        log_path: str | None,
+        *,
+        run_label: str | None = None,
+        module_filters: list[str] | None = None,
+    ) -> None:
         binary_label = Path(binary_path).name or binary_path
         if not self._ensure_aslr_disabled_for_execution(binary_label):
             return
         try:
-            result_path = self.controller.run_binary(binary_path, log_path=log_path)
-            self._on_run_success(binary_path, str(result_path))
+            result_path = self.controller.run_binary(
+                binary_path,
+                log_path=log_path,
+                module_filters=module_filters,
+            )
+            self._on_run_success(binary_path, str(result_path), run_label=run_label)
         except Exception as exc:
             self._on_run_failure(exc)
 
@@ -3821,6 +6183,7 @@ class App(QMainWindow):
         parent_entry_id: str | None = None,
         sanitized_binary_path: str | None = None,
         is_sanitized_run: bool = False,
+        module_filters: list[str] | None = None,
     ) -> None:
         binary_label = Path(binary_path).name or binary_path
         if not self._ensure_aslr_disabled_for_execution(binary_label):
@@ -3831,7 +6194,7 @@ class App(QMainWindow):
             dialog_label or Path(binary_path).name or binary_path,
             on_stop=self._request_stop_current_run,
         )
-        worker = RunWorker(self.controller, binary_path, log_path)
+        worker = RunWorker(self.controller, binary_path, log_path, module_filters=module_filters)
         thread = QThread(self)
         worker.moveToThread(thread)
 
@@ -3849,6 +6212,7 @@ class App(QMainWindow):
             "parent_entry_id": parent_entry_id,
             "sanitized_binary_path": sanitized_binary_path,
             "is_sanitized_run": is_sanitized_run,
+            "module_filters": module_filters,
         }
 
         worker.succeeded.connect(self._handle_run_worker_success)
@@ -3874,7 +6238,6 @@ class App(QMainWindow):
             self._append_console(f"Unable to stop run: {exc}")
 
     def _handle_run_worker_success(self, log_path: str) -> None:
-        dialog = self._current_run_dialog
         params = self._current_run_params or {}
         binary_path = params.get("binary_path")
         record_entry = params.get("record_entry", True)
@@ -3883,6 +6246,7 @@ class App(QMainWindow):
         parent_entry_id = params.get("parent_entry_id")
         sanitized_binary_path = params.get("sanitized_binary_path")
         is_sanitized_run = params.get("is_sanitized_run", False)
+        dialog = self._current_run_dialog
         if dialog:
             dialog.append_output("Run completed successfully.")
             dialog.mark_finished(True)

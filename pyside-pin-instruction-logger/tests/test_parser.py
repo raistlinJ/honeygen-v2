@@ -31,6 +31,18 @@ Executed instruction at: 7c5473fc3143 - call 0x7c5473fc3ca0
         result = parse_log(log_data)
         self.assertEqual(result, expected_output)
 
+    def test_parse_pin_logger_with_metadata_block(self) -> None:
+        log_data = """\
+Executed instruction at: 0x401000 [pid=123 tid=1] - mov eax, ebx
+Executed instruction at: 0x401002 [pid=123 tid=1] - add eax, 1
+"""
+        expected_output = [
+            {"address": "0x401000", "instruction": "mov eax, ebx"},
+            {"address": "0x401002", "instruction": "add eax, 1"},
+        ]
+        result = parse_log(log_data)
+        self.assertEqual(result, expected_output)
+
     def test_parse_colon_format_from_file(self) -> None:
         log_data = """\
 0x00400500: mov eax, ebx

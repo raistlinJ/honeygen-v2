@@ -36,3 +36,42 @@ def collect_executed_addresses(log_path: Path | str) -> ExecutedAddressReport:
             if instruction:
                 sampled.append((address_int, instruction))
     return ExecutedAddressReport(addresses=executed, parsed_rows=len(instructions), sampled_instructions=sampled)
+
+
+def compute_address_segments(
+    entries: Iterable[dict[str, str]],
+    *,
+    max_gap: int = 16,
+) -> tuple[list[int], list[tuple[int, int]]]:
+    """Return sorted addresses and contiguous segments derived from parsed log entries."""
+    seen: set[int] = set()
+    addresses: list[int] = []
+    for entry in entries:
+        raw_address = entry.get("address") if isinstance(entry, dict) else None
+        if not raw_address:
+            continue
+        try:
+            address_int = int(raw_address, 16)
+        except (TypeError, ValueError):
+            continue
+        if address_int in seen:
+            continue
+        seen.add(address_int)
+        addresses.append(address_int)
+    addresses.sort()
+    segments = _contiguous_segments_from_sorted(addresses, max_gap=max_gap)
+    return addresses, segments
+
+
+def _contiguous_segments_from_sorted(addresses: list[int], *, max_gap: int) -> list[tuple[int, int]]:
+    if not addresses:
+        return []
+    segments: list[tuple[int, int]] = []
+    start = prev = addresses[0]
+    for address in addresses[1:]:
+        if address - prev > max_gap:
+            segments.append((start, prev))
+            start = address
+        prev = address
+    segments.append((start, prev))
+    return segments

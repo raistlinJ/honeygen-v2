@@ -4,10 +4,16 @@ import os
 import stat
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable, Callable
 
 import capstone
 import lief
+
+
+class PreviewCancelled(Exception):
+    """Raised when preview disassembly is cancelled mid-way."""
+
+    pass
 
 
 @dataclass
@@ -168,6 +174,86 @@ class BinarySanitizer:
                 raise RuntimeError(
                     f"Instruction mismatch at 0x{address:x}: expected '{expected_clean}', got '{actual}'"
                 )
+
+    def preview_instructions(
+        self,
+        binary: lief.Binary,
+        addresses: Iterable[Any],
+        *,
+        max_bytes: int = 16,
+        on_progress: Callable[[int, int], None] | None = None,
+        should_cancel: Callable[[], bool] | None = None,
+        progress_interval: int = 100,
+    ) -> list[tuple[int, str]]:
+        arch, mode, _ = self._capstone_config(binary)
+        md = capstone.Cs(arch, mode)
+        md.detail = False
+        normalized = self._normalize_preview_addresses(addresses)
+        total = len(normalized)
+        processed = 0
+        if on_progress:
+            on_progress(processed, total)
+        results: list[tuple[int, str]] = []
+        for address in normalized:
+            if should_cancel and should_cancel():
+                raise PreviewCancelled()
+            try:
+                raw = binary.get_content_from_virtual_address(address, max_bytes)
+            except Exception:
+                results.append((address, "<unavailable>"))
+            else:
+                data = bytes(raw)
+                if not data:
+                    results.append((address, "<no-bytes>"))
+                else:
+                    instruction = next(md.disasm(data, address), None)
+                    if instruction is None:
+                        results.append((address, "<unable to disassemble>"))
+                    else:
+                        text = f"{instruction.mnemonic} {instruction.op_str}".strip()
+                        results.append((address, text))
+            processed += 1
+            if on_progress and (processed == total or processed % max(progress_interval, 1) == 0):
+                on_progress(processed, total)
+        return results
+
+    def _normalize_preview_addresses(self, entries: Iterable[Any]) -> list[int]:
+        normalized: list[int] = []
+        seen: set[int] = set()
+        for entry in entries:
+            address = self._coerce_address_like(entry)
+            if address is None or address in seen:
+                continue
+            seen.add(address)
+            normalized.append(address)
+        return normalized
+
+    def _coerce_address_like(self, entry: Any) -> int | None:
+        if isinstance(entry, int):
+            return entry
+        if isinstance(entry, str):
+            return self._parse_address_text(entry)
+        if isinstance(entry, (tuple, list)) and entry:
+            return self._coerce_address_like(entry[0])
+        if isinstance(entry, dict):
+            raw = entry.get("address")
+            return self._coerce_address_like(raw) if raw is not None else None
+        return None
+
+    def _parse_address_text(self, raw: str) -> int | None:
+        text = (raw or "").strip()
+        if not text:
+            return None
+        lowered = text.lower()
+        if lowered.startswith("0x"):
+            lowered = lowered[2:]
+        try:
+            return int(lowered, 16)
+        except ValueError:
+            try:
+                return int(lowered, 10)
+            except ValueError:
+                return None
 
     def _resolve_elf_execinstr_flag(self) -> int:
         elf_module = getattr(lief, "ELF", None)
