@@ -39,13 +39,26 @@ class TestBinarySanitizerVerification(unittest.TestCase):
 
     def test_verify_logged_instructions_passes_for_matching_sample(self) -> None:
         address, text = self._reference_instruction
-        self.sanitizer.verify_logged_instructions(self.binary, [(address, text)])
+        mismatches = self.sanitizer.verify_logged_instructions(self.binary, [(address, text)])
+        self.assertEqual(mismatches, [])
 
     def test_verify_logged_instructions_raises_for_mismatch(self) -> None:
         address, text = self._reference_instruction
         mismatched_text = text + " /* mismatch */"
         with self.assertRaises(RuntimeError):
             self.sanitizer.verify_logged_instructions(self.binary, [(address, mismatched_text)])
+
+    def test_verify_logged_instructions_collects_mismatches_when_configured(self) -> None:
+        address, text = self._reference_instruction
+        mismatched_text = text + " /* mismatch */"
+        mismatches = self.sanitizer.verify_logged_instructions(
+            self.binary,
+            [(address, mismatched_text)],
+            stop_on_mismatch=False,
+        )
+        self.assertEqual(len(mismatches), 1)
+        self.assertEqual(mismatches[0].address, address)
+        self.assertEqual(mismatches[0].expected.lower(), text.lower() + " /* mismatch */".lower())
 
     def test_preview_instructions_matches_reference(self) -> None:
         address, text = self._reference_instruction

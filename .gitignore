@@ -8,3 +8,9 @@ pyside-pin-instruction-logger/pin_logs/
 pyside-pin-instruction-logger/instruction_log.txt
 
 pyside-pin-instruction-logger/src/__pycache__/
+
+pyside-pin-instruction-logger/.unique_logs/
+
+pyside-pin-instruction-logger/.venv/
+pyside-pin-instruction-logger/.venv_py312/
+pyside-pin-instruction-logger/.vscode/

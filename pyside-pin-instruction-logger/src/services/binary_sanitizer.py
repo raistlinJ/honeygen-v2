@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import stat
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Callable
@@ -24,6 +26,13 @@ class SanitizationResult:
     output_path: Path
 
 
+@dataclass
+class InstructionMismatch:
+    address: int
+    expected: str
+    actual: str
+
+
 class BinarySanitizer:
     """Replace non-executed instructions with architecture-appropriate NOPs."""
 
@@ -39,6 +48,8 @@ class BinarySanitizer:
         forced_mode: int | None = None,
         only_text_section: bool = False,
         binary: lief.Binary | None = None,
+        preserve_trampolines: bool = True,
+        protected_ranges: list[tuple[int, int]] | None = None,
     ) -> SanitizationResult:
         if not binary_path.exists():
             raise FileNotFoundError(f"Binary not found: {binary_path}")
@@ -65,7 +76,11 @@ class BinarySanitizer:
                 raise ValueError("No executable .text sections found in the binary for sanitization.")
             sections = text_sections
 
+        normalized_ranges = self._normalize_ranges(protected_ranges)
+
         for section in sections:
+            if self._should_skip_section(section, preserve_trampolines):
+                continue
             data = bytes(section.content)
             if not data:
                 continue
@@ -73,6 +88,8 @@ class BinarySanitizer:
                 total += 1
                 address = int(instruction.address)
                 if address in executed_addresses:
+                    continue
+                if normalized_ranges and self._address_in_ranges(address, normalized_ranges):
                     continue
                 nop_bytes = nop_generator(instruction.size)
                 self._patch_bytes(binary_obj, address, nop_bytes)
@@ -129,6 +146,48 @@ class BinarySanitizer:
         name = getattr(section, "name", "") or ""
         return name.lower().startswith(".text")
 
+    def _should_skip_section(self, section: lief.Section, preserve_trampolines: bool) -> bool:
+        """Leave critical trampolines intact even if they never appear in the log."""
+        if not preserve_trampolines:
+            return False
+        name = (getattr(section, "name", "") or "").lower()
+        if not name:
+            return False
+        if name.startswith(".plt"):
+            return True
+        # Keep early-process scaffolding such as .init/.fini even if the trace missed them.
+        return name in {".init", ".fini"}
+
+    @staticmethod
+    def _normalize_ranges(ranges: list[tuple[int, int]] | None) -> list[tuple[int, int]]:
+        if not ranges:
+            return []
+        cleaned: list[tuple[int, int]] = []
+        for start, end in sorted((min(a, b), max(a, b)) for a, b in ranges if a is not None and b is not None):
+            if cleaned and start <= cleaned[-1][1]:
+                prev_start, prev_end = cleaned[-1]
+                cleaned[-1] = (prev_start, max(prev_end, end))
+            else:
+                cleaned.append((start, end))
+        return cleaned
+
+    @staticmethod
+    def _address_in_ranges(address: int, ranges: list[tuple[int, int]]) -> bool:
+        if not ranges:
+            return False
+        left = 0
+        right = len(ranges) - 1
+        while left <= right:
+            mid = (left + right) // 2
+            start, end = ranges[mid]
+            if address < start:
+                right = mid - 1
+            elif address > end:
+                left = mid + 1
+            else:
+                return True
+        return False
+
     def _patch_bytes(self, binary: lief.Binary, address: int, data: bytes) -> None:
         binary.patch_address(address, list(data))
 
@@ -148,12 +207,14 @@ class BinarySanitizer:
         samples: list[tuple[int, str]],
         *,
         max_bytes: int = 16,
-    ) -> None:
+        stop_on_mismatch: bool = True,
+    ) -> list[InstructionMismatch]:
         if not samples:
-            return
+            return []
         arch, mode, _ = self._capstone_config(binary)
         md = capstone.Cs(arch, mode)
         md.detail = False
+        mismatches: list[InstructionMismatch] = []
         for address, expected in samples:
             expected_clean = (expected or "").strip()
             if not expected_clean:
@@ -171,9 +232,13 @@ class BinarySanitizer:
                 raise RuntimeError(f"Unable to disassemble instruction at 0x{address:x}")
             actual = f"{instruction.mnemonic} {instruction.op_str}".strip()
             if actual.lower() != expected_clean.lower():
-                raise RuntimeError(
-                    f"Instruction mismatch at 0x{address:x}: expected '{expected_clean}', got '{actual}'"
-                )
+                mismatch = InstructionMismatch(address, expected_clean, actual)
+                if stop_on_mismatch:
+                    raise RuntimeError(
+                        f"Instruction mismatch at 0x{address:x}: expected '{expected_clean}', got '{actual}'"
+                    )
+                mismatches.append(mismatch)
+        return mismatches
 
     def preview_instructions(
         self,
@@ -184,37 +249,94 @@ class BinarySanitizer:
         on_progress: Callable[[int, int], None] | None = None,
         should_cancel: Callable[[], bool] | None = None,
         progress_interval: int = 100,
+        max_workers: int | None = None,
     ) -> list[tuple[int, str]]:
         arch, mode, _ = self._capstone_config(binary)
-        md = capstone.Cs(arch, mode)
-        md.detail = False
         normalized = self._normalize_preview_addresses(addresses)
         total = len(normalized)
-        processed = 0
+        progress_interval = max(progress_interval, 1)
         if on_progress:
-            on_progress(processed, total)
-        results: list[tuple[int, str]] = []
-        for address in normalized:
-            if should_cancel and should_cancel():
-                raise PreviewCancelled()
+            on_progress(0, total)
+        if total == 0:
+            return []
+
+        def _disassemble_with(md: capstone.Cs, address: int) -> tuple[int, str]:
             try:
                 raw = binary.get_content_from_virtual_address(address, max_bytes)
             except Exception:
-                results.append((address, "<unavailable>"))
-            else:
-                data = bytes(raw)
-                if not data:
-                    results.append((address, "<no-bytes>"))
-                else:
-                    instruction = next(md.disasm(data, address), None)
-                    if instruction is None:
-                        results.append((address, "<unable to disassemble>"))
-                    else:
-                        text = f"{instruction.mnemonic} {instruction.op_str}".strip()
-                        results.append((address, text))
-            processed += 1
-            if on_progress and (processed == total or processed % max(progress_interval, 1) == 0):
-                on_progress(processed, total)
+                return address, "<unavailable>"
+            data = bytes(raw)
+            if not data:
+                return address, "<no-bytes>"
+            instruction = next(md.disasm(data, address), None)
+            if instruction is None:
+                return address, "<unable to disassemble>"
+            return address, f"{instruction.mnemonic} {instruction.op_str}".strip()
+
+        def _sequential_preview() -> list[tuple[int, str]]:
+            md = capstone.Cs(arch, mode)
+            md.detail = False
+            results: list[tuple[int, str]] = []
+            processed = 0
+            for address in normalized:
+                if should_cancel and should_cancel():
+                    raise PreviewCancelled()
+                results.append(_disassemble_with(md, address))
+                processed += 1
+                if on_progress and (processed == total or processed % progress_interval == 0):
+                    on_progress(processed, total)
+            return results
+
+        max_workers = max_workers or min(32, max(2, (os.cpu_count() or 4)))
+        use_parallel = max_workers > 1 and total >= max_workers * 4
+        if not use_parallel:
+            return _sequential_preview()
+
+        cancel_event = threading.Event()
+        progress_lock = threading.Lock()
+        processed = 0
+        thread_local = threading.local()
+
+        def _check_cancelled() -> bool:
+            if cancel_event.is_set():
+                return True
+            if should_cancel and should_cancel():
+                cancel_event.set()
+                return True
+            return False
+
+        def _worker(address: int) -> tuple[int, str]:
+            if _check_cancelled():
+                raise PreviewCancelled()
+            md = getattr(thread_local, "md", None)
+            if md is None:
+                md = capstone.Cs(arch, mode)
+                md.detail = False
+                thread_local.md = md
+            result = _disassemble_with(md, address)
+            if _check_cancelled():
+                raise PreviewCancelled()
+            nonlocal processed
+            emit_value: int | None = None
+            if on_progress:
+                with progress_lock:
+                    processed += 1
+                    if processed == total or processed % progress_interval == 0:
+                        emit_value = processed
+            if emit_value is not None and on_progress:
+                on_progress(emit_value, total)
+            return result
+
+        results: list[tuple[int, str]] = []
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            try:
+                for result in executor.map(_worker, normalized):
+                    results.append(result)
+            except PreviewCancelled:
+                cancel_event.set()
+                raise
+        if on_progress and processed < total:
+            on_progress(total, total)
         return results
 
     def _normalize_preview_addresses(self, entries: Iterable[Any]) -> list[int]:

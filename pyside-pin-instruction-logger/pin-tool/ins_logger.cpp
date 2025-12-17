@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cctype>
 #include <string>
+#include <unordered_set>
 #include "pin.H"
 
 std::ofstream logFile;
@@ -14,6 +15,8 @@ std::vector<std::unique_ptr<std::string>> g_disassembly_cache;
 PIN_LOCK g_log_lock;
 std::vector<std::string> g_allowed_modules;
 bool g_trace_all_modules = false;
+bool g_unique_only = false;
+std::unordered_set<ADDRINT> g_logged_addresses;
 
 KNOB<std::string> KnobModules(
     KNOB_MODE_WRITEONCE,
@@ -21,6 +24,14 @@ KNOB<std::string> KnobModules(
     "modules",
     "",
     "Comma-separated module names to trace (use * to include every module)."
+);
+
+KNOB<BOOL> KnobUniqueOnly(
+    KNOB_MODE_WRITEONCE,
+    "pintool",
+    "unique_only",
+    "0",
+    "Only log the first execution of each instruction address."
 );
 
 static std::string ToLower(const std::string &value) {
@@ -104,6 +115,13 @@ static BOOL IsApplicationInstruction(INS ins) {
 
 VOID recordInstruction(THREADID tid, ADDRINT address, const std::string *disassembly) {
     PIN_GetLock(&g_log_lock, tid + 1);
+    if (g_unique_only) {
+        auto insert_result = g_logged_addresses.insert(address);
+        if (!insert_result.second) {
+            PIN_ReleaseLock(&g_log_lock);
+            return;
+        }
+    }
     logFile << "Executed instruction at: 0x" << std::hex << address
             << " [pid=" << PIN_GetPid() << " tid=" << tid << "] - "
             << *disassembly << std::endl;
@@ -129,6 +147,7 @@ VOID Fini(INT32 code, VOID *v) {
         logFile.close();
     }
     g_disassembly_cache.clear();
+    g_logged_addresses.clear();
 }
 
 int main(int argc, char *argv[]) {
@@ -146,6 +165,7 @@ int main(int argc, char *argv[]) {
     PIN_InitLock(&g_log_lock);
     PIN_Init(argc, argv);
     ConfigureModuleFilters();
+    g_unique_only = KnobUniqueOnly.Value();
     INS_AddInstrumentFunction(instruction, 0);
     PIN_AddFollowChildProcessFunction(FollowChild, nullptr);
     PIN_AddFiniFunction(Fini, 0);

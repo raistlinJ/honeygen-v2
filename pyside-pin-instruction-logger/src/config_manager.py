@@ -14,6 +14,26 @@ CONFIG_PATH = Path(__file__).resolve().parent / "config" / "app_settings.json"
 
 
 @dataclass
+class ProjectConfig:
+    pin_root: str = str(DEFAULT_PIN_ROOT)
+    log_path: str = str(DEFAULT_LOG_PATH)
+    binary_path: str = ""
+    tool_path: str = str(DEFAULT_TOOL_PATH)
+    revng_docker_image: str = "revng/revng"
+
+    # Sanitization preferences (GUI defaults). Keep conservative values by default.
+    sanitize_runnable_first: bool = True
+    sanitize_only_text: bool = False
+    sanitize_preserve_trampolines: bool = True
+    sanitize_protect_dynlinks: bool = True
+    sanitize_protect_unwind: bool = True
+    sanitize_protect_indirect: bool = True
+    sanitize_segment_padding: str = "0x2000"
+    sanitize_icf_window: str = "0x400"
+    sanitize_jumptable_window: str = "0x800"
+
+
+@dataclass
 class AppConfig:
     pin_root: str = str(DEFAULT_PIN_ROOT)
     log_path: str = str(DEFAULT_LOG_PATH)
@@ -22,6 +42,7 @@ class AppConfig:
     projects: list[str] = field(default_factory=lambda: ["Default Project"])
     active_project: str | None = None
     revng_docker_image: str = "revng/revng"
+    project_settings: dict[str, ProjectConfig] = field(default_factory=dict)
 
 
 class ConfigManager:
@@ -38,9 +59,17 @@ class ConfigManager:
         except json.JSONDecodeError:
             return self._save_default()
 
-        merged: dict[str, Any] = asdict(AppConfig())
-        merged.update({k: v for k, v in data.items() if k in merged})
-        config = AppConfig(**merged)
+        config = AppConfig()
+        for key, value in data.items():
+            if key == "project_settings":
+                continue
+            if hasattr(config, key):
+                setattr(config, key, value)
+
+        raw_settings = data.get("project_settings")
+        config.project_settings = self._parse_project_settings(raw_settings, config)
+        self._ensure_project_settings(config)
+
         if not config.projects:
             config.projects = ["Default Project"]
         if not config.active_project or config.active_project not in config.projects:
@@ -48,9 +77,49 @@ class ConfigManager:
         return config
 
     def save(self, config: AppConfig) -> None:
-        self.path.write_text(json.dumps(asdict(config), indent=2), encoding="utf-8")
+        payload = asdict(config)
+        payload["project_settings"] = {
+            name: asdict(settings) for name, settings in config.project_settings.items()
+        }
+        self.path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     def _save_default(self) -> AppConfig:
         config = AppConfig()
+        self._ensure_project_settings(config)
         self.save(config)
         return config
+
+    def _parse_project_settings(self, raw: Any, fallback: AppConfig) -> dict[str, ProjectConfig]:
+        if not isinstance(raw, dict):
+            return {}
+        project_settings: dict[str, ProjectConfig] = {}
+        for name, value in raw.items():
+            project_settings[name] = self._build_project_config(value, fallback)
+        return project_settings
+
+    def _build_project_config(self, raw: Any, fallback: AppConfig) -> ProjectConfig:
+        base = ProjectConfig(
+            pin_root=fallback.pin_root,
+            log_path=fallback.log_path,
+            binary_path=fallback.binary_path,
+            tool_path=fallback.tool_path,
+            revng_docker_image=fallback.revng_docker_image,
+        )
+        if isinstance(raw, dict):
+            for key, value in raw.items():
+                if hasattr(base, key):
+                    setattr(base, key, value)
+        return base
+
+    def _ensure_project_settings(self, config: AppConfig) -> None:
+        if not config.projects:
+            config.projects = ["Default Project"]
+        for name in config.projects:
+            if name not in config.project_settings:
+                config.project_settings[name] = ProjectConfig(
+                    pin_root=config.pin_root,
+                    log_path=config.log_path,
+                    binary_path=config.binary_path,
+                    tool_path=config.tool_path,
+                    revng_docker_image=config.revng_docker_image,
+                )

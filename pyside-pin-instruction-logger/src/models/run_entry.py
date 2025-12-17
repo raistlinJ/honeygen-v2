@@ -22,6 +22,12 @@ class RunEntry:
     is_sanitized_run: bool = False
     prepared_segments: list[tuple[int, int]] | None = None
     prepared_at: datetime | None = None
+    binary_offset: int = 0
+    trace_address_count: int = 0
+    binary_instruction_count: int = 0
+    sanitized_total_instructions: int = 0
+    sanitized_preserved_instructions: int = 0
+    sanitized_nopped_instructions: int = 0
 
     def label(self) -> str:
         prefix = "[SAN] " if self.is_sanitized_run else ""

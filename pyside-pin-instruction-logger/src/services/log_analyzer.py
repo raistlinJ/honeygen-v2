@@ -19,23 +19,26 @@ class ExecutedAddressReport:
 
 def collect_executed_addresses(log_path: Path | str) -> ExecutedAddressReport:
     """Return the set of instruction addresses present in a PIN log alongside basic stats."""
-    instructions = parser.parse_log(log_path)
     executed: set[int] = set()
     sampled: list[tuple[int, str]] = []
-    for entry in instructions:
+    parsed_rows = 0
+    for entry in parser.iter_log_entries(log_path):
         raw_address = entry.get("address")
         if not raw_address:
+            parsed_rows += 1
             continue
         try:
             address_int = int(raw_address, 16)
         except ValueError:
+            parsed_rows += 1
             continue
         executed.add(address_int)
         if len(sampled) < SAMPLE_LIMIT:
             instruction = entry.get("instruction", "").strip()
             if instruction:
                 sampled.append((address_int, instruction))
-    return ExecutedAddressReport(addresses=executed, parsed_rows=len(instructions), sampled_instructions=sampled)
+        parsed_rows += 1
+    return ExecutedAddressReport(addresses=executed, parsed_rows=parsed_rows, sampled_instructions=sampled)
 
 
 def compute_address_segments(

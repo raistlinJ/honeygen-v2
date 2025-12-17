@@ -65,6 +65,7 @@ pyside-pin-instruction-logger
    uv run python scripts/run_with_pin.py ./path/to/binary -- --arg1 --arg2
    ```
 - By default both the GUI and CLI call `/home/researchdev/Downloads/pin4/pin`. Override by setting `PIN_ROOT=/custom/pin` before running.
+- When preparing a log that will later drive sanitization, make sure lazy-binding stubs (PLT entries) actually execute. The quickest way is to set `LD_BIND_NOW=1` for that run (in the GUI, add it under “Environment Overrides”; via CLI run `LD_BIND_NOW=1 uv run python scripts/run_with_pin.py …`). This forces glibc to resolve every PLT slot up front so the trace covers those addresses and the sanitizer leaves them intact. If you can’t rerun with that flag, leave the **Preserve PLT/.init/.fini sections** toggle (enabled by default) turned on so the sanitizer skips those trampolines for you.
 
 ## Contributing
 

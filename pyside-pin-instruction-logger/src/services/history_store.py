@@ -11,6 +11,13 @@ from models.run_entry import RunEntry
 HISTORY_PATH = Path(__file__).resolve().parents[1] / "config" / "honey_history.json"
 
 
+def _as_int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
 class HistoryStore:
     def __init__(self, path: Path | None = None) -> None:
         self.path = path or HISTORY_PATH
@@ -33,6 +40,16 @@ class HistoryStore:
                     prepared_at = datetime.fromisoformat(prepared_at_raw)
                 except ValueError:
                     prepared_at = None
+            binary_offset = raw.get("binary_offset", 0)
+            try:
+                binary_offset = int(binary_offset)
+            except (TypeError, ValueError):
+                binary_offset = 0
+            trace_count = _as_int(raw.get("trace_address_count", 0))
+            binary_count = _as_int(raw.get("binary_instruction_count", 0))
+            sanitized_total = _as_int(raw.get("sanitized_total_instructions", 0))
+            sanitized_preserved = _as_int(raw.get("sanitized_preserved_instructions", 0))
+            sanitized_nopped = _as_int(raw.get("sanitized_nopped_instructions", 0))
             entries.append(
                 RunEntry(
                     entry_id=raw.get("entry_id") or str(uuid4()),
@@ -45,6 +62,12 @@ class HistoryStore:
                     is_sanitized_run=raw.get("is_sanitized_run", False),
                     prepared_segments=prepared_segments or None,
                     prepared_at=prepared_at,
+                    binary_offset=binary_offset,
+                    trace_address_count=trace_count,
+                    binary_instruction_count=binary_count,
+                    sanitized_total_instructions=sanitized_total,
+                    sanitized_preserved_instructions=sanitized_preserved,
+                    sanitized_nopped_instructions=sanitized_nopped,
                 )
             )
         return entries
@@ -91,6 +114,12 @@ class HistoryStore:
             "is_sanitized_run": entry.is_sanitized_run,
             "prepared_segments": self._format_segments(entry.prepared_segments),
             "prepared_at": entry.prepared_at.isoformat() if entry.prepared_at else None,
+            "binary_offset": int(entry.binary_offset or 0),
+            "trace_address_count": int(getattr(entry, "trace_address_count", 0) or 0),
+            "binary_instruction_count": int(getattr(entry, "binary_instruction_count", 0) or 0),
+            "sanitized_total_instructions": int(getattr(entry, "sanitized_total_instructions", 0) or 0),
+            "sanitized_preserved_instructions": int(getattr(entry, "sanitized_preserved_instructions", 0) or 0),
+            "sanitized_nopped_instructions": int(getattr(entry, "sanitized_nopped_instructions", 0) or 0),
         }
 
     def _read_all(self) -> dict[str, list[dict[str, Any]]]:

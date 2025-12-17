@@ -44,12 +44,14 @@ class RunnerController:
         *,
         log_path: str | None = None,
         module_filters: Sequence[str] | None = None,
+        unique_only: bool = False,
         on_output: Callable[[str], None] | None = None,
     ) -> Path:
         return self.pin_runner.run(
             binary_path,
             log_path=log_path,
             modules=module_filters,
+            unique_only=unique_only,
             on_output=on_output,
         )
 

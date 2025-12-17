@@ -42,6 +42,7 @@ class PinRunner:
         env: dict[str, str] | None = None,
         timeout: float | None = None,
         on_output: Callable[[str], None] | None = None,
+        unique_only: bool = False,
     ) -> Path:
         binary = Path(binary_path)
         if not binary.exists():
@@ -63,6 +64,8 @@ class PinRunner:
             joined = ",".join(part.strip() for part in modules if part and part.strip())
             if joined:
                 tool_args.extend(["-modules", joined])
+        if unique_only:
+            tool_args.extend(["-unique_only", "1"])
 
         command: list[str] = [str(pin_exe), "-t", str(tool), *tool_args, "--", str(binary)]
         if extra_target_args:

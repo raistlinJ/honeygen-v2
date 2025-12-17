@@ -18,11 +18,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run a target binary with Intel PIN")
     parser.add_argument("target", help="Path to the binary you want to instrument")
     parser.add_argument(
-        "target_args",
-        nargs=argparse.REMAINDER,
-        help="Arguments passed verbatim to the target (prefix them with -- to stop parsing)",
-    )
-    parser.add_argument(
         "--pin-root",
         default=str(PIN_ROOT_DEFAULT),
         help="Path to the Intel PIN kit root (defaults to /home/researchdev/Downloads/pin4)",
@@ -37,6 +32,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Path to the log file produced by the run (defaults to pin_logs/instruction_log.txt)",
     )
+    parser.add_argument(
+        "--unique-only",
+        action="store_true",
+        help="Only record the first execution of each instruction address",
+    )
+    parser.add_argument(
+        "target_args",
+        nargs=argparse.REMAINDER,
+        help="Arguments passed verbatim to the target (use -- to stop parsing)",
+    )
     return parser
 
 
@@ -48,7 +53,11 @@ def main(argv: list[str] | None = None) -> int:
     runner = PinRunner(pin_bin=pin_bin, tool_path=args.tool, default_log=args.log)
 
     try:
-        log_file = runner.run(args.target, extra_target_args=args.target_args)
+        log_file = runner.run(
+            args.target,
+            extra_target_args=args.target_args,
+            unique_only=args.unique_only,
+        )
     except Exception as exc:  # pragma: no cover - CLI feedback path
         parser.error(str(exc))
 
