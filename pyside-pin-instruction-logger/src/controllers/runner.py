@@ -45,13 +45,19 @@ class RunnerController:
         log_path: str | None = None,
         module_filters: Sequence[str] | None = None,
         unique_only: bool = False,
+        use_sudo: bool = False,
+        sudo_password: str | None = None,
         on_output: Callable[[str], None] | None = None,
+        extra_target_args: Sequence[str] | None = None,
     ) -> Path:
         return self.pin_runner.run(
             binary_path,
             log_path=log_path,
             modules=module_filters,
+            extra_target_args=extra_target_args,
             unique_only=unique_only,
+            use_sudo=use_sudo,
+            sudo_password=sudo_password,
             on_output=on_output,
         )
 

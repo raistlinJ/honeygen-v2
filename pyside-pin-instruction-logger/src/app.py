@@ -228,6 +228,10 @@ class RunWorker(QObject):
         log_path: str | None,
         module_filters: list[str] | None = None,
         unique_only: bool = False,
+        use_sudo: bool = False,
+        sudo_password: str | None = None,
+        extra_target_args: list[str] | None = None,
+        pre_run_command: str | None = None,
     ) -> None:
         super().__init__()
         self.controller = controller
@@ -235,15 +239,66 @@ class RunWorker(QObject):
         self.log_path = log_path
         self.module_filters = list(module_filters) if module_filters else None
         self.unique_only = bool(unique_only)
+        self.use_sudo = bool(use_sudo)
+        self.sudo_password = sudo_password
+        self.extra_target_args = list(extra_target_args) if extra_target_args else None
+        self.pre_run_command = pre_run_command or None
 
     def run(self) -> None:  # pragma: no cover - runs in worker thread
         try:
+            # Execute optional pre-run command or script before launching PIN
+            if self.pre_run_command:
+                from pathlib import Path as _Path
+                import subprocess as _subprocess
+                import os as _os
+                cmd: list[str]
+                try:
+                    _p = _Path(self.pre_run_command)
+                    if _p.exists() and _p.is_file():
+                        cmd = ["bash", str(_p)]
+                    else:
+                        cmd = ["bash", "-lc", self.pre_run_command]
+                except Exception:
+                    cmd = ["bash", "-lc", self.pre_run_command]
+                if self.use_sudo and self.sudo_password:
+                    cmd = ["sudo", "-S", "-p", "", *cmd]
+                proc = _subprocess.Popen(
+                    cmd,
+                    stdout=_subprocess.PIPE,
+                    stderr=_subprocess.STDOUT,
+                    stdin=_subprocess.PIPE if (self.use_sudo and self.sudo_password) else None,
+                    text=True,
+                    bufsize=1,
+                    cwd=_os.getcwd(),
+                )
+                if self.use_sudo and self.sudo_password and proc.stdin is not None:
+                    try:
+                        proc.stdin.write(self.sudo_password + "\n")
+                        proc.stdin.flush()
+                    except BrokenPipeError:
+                        pass
+                    finally:
+                        try:
+                            proc.stdin.close()
+                        except OSError:
+                            pass
+                assert proc.stdout is not None
+                for line in proc.stdout:
+                    clean = line.rstrip()
+                    if clean:
+                        self.output.emit(clean)
+                proc.wait()
+                if proc.returncode != 0:
+                    raise RuntimeError("Pre-run command failed with non-zero exit status")
             result = self.controller.run_binary(
                 self.binary_path,
                 log_path=self.log_path,
                 module_filters=self.module_filters,
                 unique_only=self.unique_only,
+                use_sudo=self.use_sudo,
+                sudo_password=self.sudo_password,
                 on_output=self.output.emit,
+                extra_target_args=self.extra_target_args,
             )
             self.succeeded.emit(str(result))
         except Exception as exc:
@@ -277,32 +332,27 @@ class RunProgressDialog(QDialog):
         layout.addWidget(self.output_view)
         layout.addWidget(self.progress_bar)
         layout.addWidget(self.buttons)
-        self.resize(760, 520)
+        # Ensure stop button reflects callback availability
+        if self.stop_button:
+            self.stop_button.setEnabled(on_stop is not None and self._running)
 
     def append_output(self, text: str) -> None:
+        """Append a line of text to the output view."""
         self.output_view.appendPlainText(text)
 
     def mark_finished(self, success: bool) -> None:
+        """Mark the run as finished and enable the close button."""
         self._running = False
         self.progress_bar.setRange(0, 1)
         self.progress_bar.setValue(1)
-        state = "completed" if success else "failed"
-        self.status_label.setText(f"Run {state}.")
         if self.close_button:
             self.close_button.setEnabled(True)
         if self.stop_button:
             self.stop_button.setEnabled(False)
-
-    def closeEvent(self, event) -> None:  # type: ignore[override]
-        if self._running:
-            event.ignore()
-            return
-        super().closeEvent(event)
-
-    def set_stop_callback(self, callback: Callable[[], None] | None) -> None:
-        self._stop_callback = callback
-        if self.stop_button:
-            self.stop_button.setEnabled(callback is not None and self._running)
+        if success:
+            self.status_label.setText("Run completed successfully.")
+        else:
+            self.status_label.setText("Run failed or was stopped.")
 
     def _handle_stop_clicked(self) -> None:
         if not self._stop_callback:
@@ -324,12 +374,15 @@ class ModuleSelectionDialog(QDialog):
         filename_builder: Callable[[str], str] | None = None,
         previous_selection: list[str] | None = None,
         default_unique_only: bool = False,
+        default_run_with_sudo: bool = False,
+        default_pre_run_command: str | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle(f"Select Modules — {binary_label}")
         self._modules = modules
         self._previous = list(previous_selection or [])
         self._filename_builder = filename_builder
+        self._default_pre_run_command = default_pre_run_command or ""
         layout = QVBoxLayout(self)
         description = QLabel(
             "Choose which modules to monitor while collecting the instruction log. "
@@ -358,6 +411,29 @@ class ModuleSelectionDialog(QDialog):
         )
         self.unique_only_checkbox.setChecked(default_unique_only)
         layout.addWidget(self.unique_only_checkbox)
+
+        self.run_with_sudo_checkbox = QCheckBox("Run with sudo", self)
+        self.run_with_sudo_checkbox.setChecked(bool(default_run_with_sudo))
+        self.run_with_sudo_checkbox.setToolTip(
+            "Run the target under sudo (PIN + target as root). You will be prompted for your sudo password."
+        )
+        layout.addWidget(self.run_with_sudo_checkbox)
+
+        prerun_group = QGroupBox("Pre-Run Setup", self)
+        prerun_layout = QVBoxLayout(prerun_group)
+        prerun_layout.setContentsMargins(8, 8, 8, 8)
+        prerun_help = QLabel(
+            "Optional: Enter a shell command or script path to run before launching the target.",
+            prerun_group,
+        )
+        prerun_help.setWordWrap(True)
+        self.prerun_input = QLineEdit(self)
+        self.prerun_input.setPlaceholderText("e.g., /path/to/setup.sh or 'mkdir -p /tmp/sshd && cp ...'")
+        if self._default_pre_run_command:
+            self.prerun_input.setText(self._default_pre_run_command)
+        prerun_layout.addWidget(prerun_help)
+        prerun_layout.addWidget(self.prerun_input)
+        layout.addWidget(prerun_group)
 
         self.module_list = QListWidget(self)
         self.module_list.setSelectionMode(QAbstractItemView.NoSelection)
@@ -462,6 +538,13 @@ class ModuleSelectionDialog(QDialog):
 
     def unique_only(self) -> bool:
         return self.unique_only_checkbox.isChecked()
+
+    def run_with_sudo(self) -> bool:
+        return self.run_with_sudo_checkbox.isChecked()
+
+    def selected_pre_run_command(self) -> str | None:
+        text = self.prerun_input.text().strip()
+        return text or None
 
     def accept(self) -> None:  # type: ignore[override]
         if not self.trace_all_checkbox.isChecked() and not self.selected_modules():
@@ -1601,7 +1684,7 @@ class SanitizeWorker(QObject):
             if size <= 0:
                 continue
             ranges.append((start, start + size))
-        return self._merge_ranges(ranges)
+        return SanitizeWorker._merge_ranges(ranges)
 
     @staticmethod
     def _infer_unwind_protected_ranges(binary: "lief.Binary") -> list[tuple[int, int]]:
@@ -1616,7 +1699,7 @@ class SanitizeWorker(QObject):
             if size <= 0:
                 continue
             ranges.append((start, start + size))
-        return self._merge_ranges(ranges)
+        return SanitizeWorker._merge_ranges(ranges)
 
     def _mismatch_log_path(self) -> Path:
         base = self.output_path
@@ -1786,6 +1869,8 @@ class RunSanitizedOptions(NamedTuple):
     collect_cpu_metrics: bool
     collect_memory_metrics: bool
     collect_timing_metrics: bool
+    run_with_sudo: bool
+    pre_run_command: str | None
 
 
 class BuildProgressDialog(QDialog):
@@ -2141,7 +2226,7 @@ class SanitizeConfigDialog(QDialog):
 
 
 class RunSanitizedOptionsDialog(QDialog):
-    def __init__(self, parent: QWidget) -> None:
+    def __init__(self, parent: QWidget, *, default_run_with_sudo: bool = False) -> None:
         super().__init__(parent)
         self.setWindowTitle("Execute Sanitized Binary")
         self.setModal(True)
@@ -2156,7 +2241,39 @@ class RunSanitizedOptionsDialog(QDialog):
         self.pin_checkbox.setChecked(True)
         self.pin_checkbox.setToolTip("Disable if you only want to launch the sanitized binary without collecting a new trace.")
         execution_layout.addWidget(self.pin_checkbox)
+
+        self.sudo_checkbox = QCheckBox("Run with sudo", execution_group)
+        self.sudo_checkbox.setChecked(bool(default_run_with_sudo))
+        self.sudo_checkbox.setToolTip("Run the target under sudo. You will be prompted for your sudo password if needed.")
+        execution_layout.addWidget(self.sudo_checkbox)
         layout.addWidget(execution_group)
+
+        # Pre-run setup group to run commands or a script before launching
+        self.prerun_group = QGroupBox("Pre-Run Setup", self)
+        prerun_layout = QVBoxLayout(self.prerun_group)
+        prerun_layout.setContentsMargins(12, 12, 12, 12)
+        self.prerun_help = QLabel(
+            "Optional: Enter a shell command or script path to run before launching the sanitized binary.",
+            self.prerun_group,
+        )
+        self.prerun_help.setWordWrap(True)
+        self.prerun_input = QLineEdit(self.prerun_group)
+        self.prerun_input.setPlaceholderText("e.g., /path/to/setup.sh or 'mkdir -p /tmp/sshd && cp ...'")
+        prerun_layout.addWidget(self.prerun_help)
+        prerun_layout.addWidget(self.prerun_input)
+        layout.addWidget(self.prerun_group)
+
+        # Invocation preview group shows inherited args/filters/sudo
+        self.invocation_group = QGroupBox("Invocation Preview", self)
+        invocation_layout = QVBoxLayout(self.invocation_group)
+        invocation_layout.setContentsMargins(12, 12, 12, 12)
+        self.args_label = QLabel("Args: (none)", self.invocation_group)
+        self.filters_label = QLabel("Module Filters: (none)", self.invocation_group)
+        self.sudo_label = QLabel("Sudo: off", self.invocation_group)
+        for w in (self.args_label, self.filters_label, self.sudo_label):
+            w.setWordWrap(True)
+            invocation_layout.addWidget(w)
+        layout.addWidget(self.invocation_group)
 
         metrics_group = QGroupBox("Collect Metrics", self)
         metrics_layout = QVBoxLayout(metrics_group)
@@ -2178,12 +2295,28 @@ class RunSanitizedOptionsDialog(QDialog):
         layout.addWidget(buttons)
         self.resize(520, 360)
 
+    def set_invocation_preview(
+        self,
+        *,
+        args: list[str] | None = None,
+        module_filters: list[str] | None = None,
+        use_sudo: bool | None = None,
+    ) -> None:
+        args_text = " ".join(args) if args else "(none)"
+        filters_text = ", ".join(module_filters) if module_filters else "(none)"
+        sudo_text = "on" if use_sudo else "off"
+        self.args_label.setText(f"Args: {args_text}")
+        self.filters_label.setText(f"Module Filters: {filters_text}")
+        self.sudo_label.setText(f"Sudo: {sudo_text}")
+
     def selected_options(self) -> RunSanitizedOptions:
         return RunSanitizedOptions(
             run_with_pin=self.pin_checkbox.isChecked(),
             collect_cpu_metrics=self.cpu_checkbox.isChecked(),
             collect_memory_metrics=self.memory_checkbox.isChecked(),
             collect_timing_metrics=self.timing_checkbox.isChecked(),
+            run_with_sudo=self.sudo_checkbox.isChecked(),
+            pre_run_command=(self.prerun_input.text().strip() or None),
         )
 
 
@@ -4468,6 +4601,28 @@ class App(QMainWindow):
         self._repo_root = Path(__file__).resolve().parents[1]
         self._projects_root_migrated = False
         self.history_store = HistoryStore()
+        # Merge any projects found in history into the config's projects list
+        try:
+            history_projects = self.history_store.list_projects()
+            added = False
+            for name in history_projects:
+                if name and name not in self.config.projects:
+                    self.config.projects.append(name)
+                    # Ensure default project settings for the new project
+                    if name not in self.config.project_settings:
+                        self.config.project_settings[name] = ProjectConfig(
+                            pin_root=self.config.pin_root,
+                            log_path=self.config.log_path,
+                            binary_path=self.config.binary_path,
+                            tool_path=self.config.tool_path,
+                            revng_docker_image=self.config.revng_docker_image,
+                        )
+                    added = True
+            if added:
+                # Persist the updated projects list so it shows in the UI consistently
+                self.config_manager.save(self.config)
+        except Exception:
+            pass
         self._legacy_projects_root: Path | None = None
         self.selected_binary: str | None = self._project_config(self.active_project).binary_path or None
         self.run_entries: list[RunEntry] = []
@@ -4564,6 +4719,7 @@ class App(QMainWindow):
         self._status_icon_cache: dict[str, QIcon] = {}
         self._last_module_filters: list[str] | None = None
         self._last_unique_only: bool = False
+        self._last_run_with_sudo: bool = False
         self._gui_invoker = GuiInvoker(self)
         self._setup_ui()
         self._refresh_project_config_ui()
@@ -4578,6 +4734,41 @@ class App(QMainWindow):
         )
         self._sync_log_destination_ui()
         self._load_history_for_active_project()
+
+    def _refresh_projects_from_history(self) -> None:
+        try:
+            history_projects = self.history_store.list_projects()
+        except Exception as exc:
+            self._append_console(f"Unable to read history projects: {exc}")
+            return
+        added = False
+        for name in history_projects:
+            if name and name not in self.config.projects:
+                self.config.projects.append(name)
+                if name not in self.config.project_settings:
+                    self.config.project_settings[name] = ProjectConfig(
+                        pin_root=self.config.pin_root,
+                        log_path=self.config.log_path,
+                        binary_path=self.config.binary_path,
+                        tool_path=self.config.tool_path,
+                        revng_docker_image=self.config.revng_docker_image,
+                    )
+                added = True
+        if added:
+            self.config_manager.save(self.config)
+            # Rebuild the UI list
+            self.project_list.blockSignals(True)
+            self.project_list.clear()
+            self.project_list.addItems(self.config.projects)
+            try:
+                current_index = self.config.projects.index(self.active_project)
+            except ValueError:
+                current_index = 0
+            self.project_list.setCurrentRow(current_index)
+            self.project_list.blockSignals(False)
+            self._append_console("Projects refreshed from history.")
+        else:
+            self._append_console("No new projects found in history.")
 
     def _apply_global_styles(self) -> None:
         app = QApplication.instance()
@@ -4645,6 +4836,11 @@ class App(QMainWindow):
         self.project_list.setContextMenuPolicy(Qt.CustomContextMenu)
         left_layout.addWidget(projects_label)
         left_layout.addWidget(self.project_list)
+        # Refresh projects from history without restarting
+        self.refresh_projects_button = QPushButton("Refresh Projects from History", left_panel)
+        self.refresh_projects_button.setToolTip("Scan history and add any missing project names to the list.")
+        self.refresh_projects_button.clicked.connect(self._refresh_projects_from_history)
+        left_layout.addWidget(self.refresh_projects_button)
 
         # Right tab area
         right_panel = QWidget(content_splitter)
@@ -4741,6 +4937,16 @@ class App(QMainWindow):
         _add_config_header("Target Binary")
         config_layout.addLayout(_build_config_row("Selected binary", self.binary_path, self.binary_button))
 
+        # Default Pre-Run Setup command/script
+        self.pre_run_command_input = QLineEdit(config_tab)
+        self.pre_run_command_input.setPlaceholderText(
+            "Default shell command or script to run before launching the target"
+        )
+        self.pre_run_command_input.setText(project_settings.default_pre_run_command or "")
+        self.test_pre_run_button = QPushButton("Test", config_tab)
+        _add_config_header("Pre-Run Setup (Default)")
+        config_layout.addLayout(_build_config_row("Command/script", self.pre_run_command_input, self.test_pre_run_button))
+
         self.tool_path = QLineEdit(config_tab)
         self.tool_path.setPlaceholderText("Intel PIN tool shared library path")
         self.tool_path.setText(project_settings.tool_path)
@@ -4810,6 +5016,11 @@ class App(QMainWindow):
         preview_layout = QVBoxLayout(preview_panel)
         preview_layout.setContentsMargins(0, 0, 0, 0)
         preview_layout.addWidget(self.log_preview_label)
+        # Invocation details label
+        self.log_invocation_label = QLabel("", preview_panel)
+        self.log_invocation_label.setObjectName("logInvocationLabel")
+        self.log_invocation_label.setStyleSheet("color: #666; font-size: 11px;")
+        preview_layout.addWidget(self.log_invocation_label)
         self.log_segments_label = QLabel("Segments", preview_panel)
         self.log_segments_label.setStyleSheet("font-weight: bold;")
         self.show_segments_button = QPushButton("Show Segments", preview_panel)
@@ -4897,13 +5108,23 @@ class App(QMainWindow):
         self.honey_parent_status.setWordWrap(True)
         self.honey_sanitized_status.hide()
         self.honey_parent_status.hide()
+        # Invocation details for current entry and parent
+        self.honey_invocation_status = QLabel("", honey_tab)
+        self.honey_invocation_status.setWordWrap(True)
+        self.honey_invocation_status.setStyleSheet("color: #666; font-size: 11px;")
+        self.honey_parent_invocation_status = QLabel("", honey_tab)
+        self.honey_parent_invocation_status.setWordWrap(True)
+        self.honey_parent_invocation_status.setStyleSheet("color: #666; font-size: 11px;")
+        honey_layout.addWidget(self.honey_invocation_status)
+        honey_layout.addWidget(self.honey_parent_invocation_status)
         self.honey_sanitized_list_label = QLabel("Generated Sanitized Binaries", honey_tab)
         self.honey_sanitized_list_label.setStyleSheet("font-weight: bold;")
         self.honey_sanitized_list = QTreeWidget(honey_tab)
-        self.honey_sanitized_list.setColumnCount(6)
+        self.honey_sanitized_list.setColumnCount(7)
         self.honey_sanitized_list.setHeaderLabels([
             "Sanitized Binary",
             "Parent Entry",
+            "Offset",
             "Total Instructions",
             "Replaced Instructions",
             "NOP Count",
@@ -4938,6 +5159,8 @@ class App(QMainWindow):
         self.tool_button.clicked.connect(self.select_tool)
         self.build_tool_button.clicked.connect(self.build_tool)
         self.revng_image_input.editingFinished.connect(self._handle_revng_image_edit)
+        self.pre_run_command_input.editingFinished.connect(self._handle_pre_run_command_edit)
+        self.test_pre_run_button.clicked.connect(self._handle_test_pre_run_command)
         self.revng_image_reset_button.clicked.connect(self._reset_revng_image)
         self.project_list.currentTextChanged.connect(self.change_active_project)
         self.project_list.customContextMenuRequested.connect(self._show_project_context_menu)
@@ -5084,6 +5307,8 @@ class App(QMainWindow):
             self.tool_path.setText(settings.tool_path)
         if hasattr(self, "revng_image_input"):
             self.revng_image_input.setText(settings.revng_docker_image or "revng/revng")
+        if hasattr(self, "pre_run_command_input"):
+            self.pre_run_command_input.setText(settings.default_pre_run_command or "")
         self.selected_binary = settings.binary_path or None
         self._update_honey_entries_label()
 
@@ -5095,6 +5320,87 @@ class App(QMainWindow):
             if settings.tool_path:
                 self.controller.set_tool_path(settings.tool_path)
             self.controller.set_log_path(str(self._project_log_path(self.active_project)))
+
+    def _handle_pre_run_command_edit(self) -> None:
+        settings = self._project_config()
+        text = (self.pre_run_command_input.text() if hasattr(self, "pre_run_command_input") else "")
+        settings.default_pre_run_command = (text or "").strip()
+        self.config.project_settings[self.active_project] = self._clone_project_settings(settings)
+        self.config_manager.save(self.config)
+        self._append_console(
+            f"Default pre-run command updated for project '{self.active_project}'."
+        )
+
+    def _handle_test_pre_run_command(self) -> None:
+        # Runs the configured pre-run command/script and streams output to the console
+        text = (self.pre_run_command_input.text() if hasattr(self, "pre_run_command_input") else "").strip()
+        if not text:
+            QMessageBox.information(self, "No command", "Enter a pre-run command/script first.")
+            return
+        # Ask if sudo is needed
+        run_with_sudo = False
+        prompt = QMessageBox.question(
+            self,
+            "Run with sudo?",
+            "Execute the pre-run using sudo?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        run_with_sudo = prompt == QMessageBox.Yes
+        sudo_password: str | None = None
+        if run_with_sudo:
+            sudo_password = self._obtain_sudo_password("Enter sudo password to run the pre-run command:")
+            if not sudo_password:
+                self._append_console("Pre-run test cancelled; sudo password not provided.")
+                return
+        self._append_console("Testing pre-run command...")
+        try:
+            from pathlib import Path as _Path
+            import subprocess as _subprocess
+            import os as _os
+            cmd: list[str]
+            try:
+                _p = _Path(text)
+                if _p.exists() and _p.is_file():
+                    cmd = ["bash", str(_p)]
+                else:
+                    cmd = ["bash", "-lc", text]
+            except Exception:
+                cmd = ["bash", "-lc", text]
+            if run_with_sudo and sudo_password:
+                cmd = ["sudo", "-S", "-p", "", *cmd]
+            proc = _subprocess.Popen(
+                cmd,
+                stdout=_subprocess.PIPE,
+                stderr=_subprocess.STDOUT,
+                stdin=_subprocess.PIPE if (run_with_sudo and sudo_password) else None,
+                text=True,
+                bufsize=1,
+                cwd=_os.getcwd(),
+            )
+            if run_with_sudo and sudo_password and proc.stdin is not None:
+                try:
+                    proc.stdin.write(sudo_password + "\n")
+                    proc.stdin.flush()
+                except BrokenPipeError:
+                    pass
+                finally:
+                    try:
+                        proc.stdin.close()
+                    except OSError:
+                        pass
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                clean = line.rstrip()
+                if clean:
+                    self._append_console(clean)
+            proc.wait()
+            if proc.returncode != 0:
+                raise RuntimeError("Pre-run command exited with non-zero status")
+            QMessageBox.information(self, "Pre-run succeeded", "The pre-run command executed successfully.")
+        except Exception as exc:
+            QMessageBox.critical(self, "Pre-run failed", str(exc))
+            self._append_console(f"Pre-run test failed: {exc}")
 
     def _project_log_filename(self, run_label: str | None = None) -> str:
         template = self._log_template_path()
@@ -6141,7 +6447,7 @@ class App(QMainWindow):
         )
         if dialog_result is None:
             return
-        module_filters, log_label, unique_only = dialog_result
+        module_filters, log_label, unique_only, run_with_sudo, pre_run_command = dialog_result
         log_path = str(self._project_log_path(run_label=log_label))
         self._run_and_record(
             self.selected_binary,
@@ -6149,6 +6455,8 @@ class App(QMainWindow):
             run_label=log_label,
             module_filters=module_filters,
             unique_only=unique_only,
+            run_with_sudo=run_with_sudo,
+            pre_run_command=pre_run_command,
         )
 
     def create_new_log_entry(self) -> None:
@@ -6166,7 +6474,7 @@ class App(QMainWindow):
         dialog_result = self._prompt_module_selection(binary, default_log_label=default_label)
         if dialog_result is None:
             return
-        module_filters, log_label, unique_only = dialog_result
+        module_filters, log_label, unique_only, run_with_sudo, pre_run_command = dialog_result
         log_path = str(self._project_log_path(run_label=log_label))
         self._run_with_progress(
             binary,
@@ -6175,6 +6483,8 @@ class App(QMainWindow):
             dialog_label=log_label,
             module_filters=module_filters,
             unique_only=unique_only,
+            run_with_sudo=run_with_sudo,
+            pre_run_command=pre_run_command,
         )
 
     def delete_log_entry(self) -> None:
@@ -6479,6 +6789,10 @@ class App(QMainWindow):
         parent_entry_id: str | None = None,
         sanitized_binary_path: str | None = None,
         is_sanitized_run: bool = False,
+        target_args: list[str] | None = None,
+        use_sudo: bool = False,
+        module_filters: list[str] | None = None,
+        pre_run_command: str | None = None,
     ) -> None:
         actual_log = log_path or str(self._project_log_path())
         timestamp = datetime.now()
@@ -6492,6 +6806,10 @@ class App(QMainWindow):
             sanitized_binary_path=sanitized_binary_path,
             parent_entry_id=parent_entry_id,
             is_sanitized_run=is_sanitized_run,
+            target_args=target_args,
+            use_sudo=use_sudo,
+            module_filters=module_filters,
+            pre_run_command=pre_run_command,
         )
         self.run_entries.append(entry)
         self._refresh_entry_views(entry.entry_id)
@@ -6576,10 +6894,13 @@ class App(QMainWindow):
                         nop_text = f"{nop_count:,}"
                     other_text = f"{preserved_count:,}" if preserved_count else "—"
                     total_text = f"{total_count:,}" if total_count else counts_text
+                    effective_offset = self._entry_effective_offset(entry)
+                    offset_text = f"{effective_offset:+#x}"
                     item = QTreeWidgetItem(
                         [
                             binary_label or "(unnamed)",
                             parent_label,
+                            offset_text,
                             total_text,
                             replaced_text,
                             nop_text,
@@ -6590,10 +6911,11 @@ class App(QMainWindow):
                     tooltip_path = str(binary_path) if binary_path else "(unsaved)"
                     item.setToolTip(0, tooltip_path)
                     item.setToolTip(1, parent_label)
-                    item.setToolTip(2, total_text)
-                    item.setToolTip(3, replaced_text)
-                    item.setToolTip(4, nop_text)
-                    item.setToolTip(5, other_text)
+                    item.setToolTip(2, offset_text)
+                    item.setToolTip(3, total_text)
+                    item.setToolTip(4, replaced_text)
+                    item.setToolTip(5, nop_text)
+                    item.setToolTip(6, other_text)
                     if binary_path and not binary_path.exists():
                         item.setForeground(0, QColor("#b00020"))
                         item.setToolTip(0, f"Missing on disk: {binary_path}")
@@ -6603,6 +6925,7 @@ class App(QMainWindow):
             else:
                 placeholder = QTreeWidgetItem([
                     "No sanitized binaries yet",
+                    "",
                     "",
                     "",
                     "",
@@ -7688,6 +8011,11 @@ class App(QMainWindow):
         if not hasattr(self, "honey_sanitized_status"):
             return
         prepared_label = getattr(self, "honey_prepared_status", None)
+        # Reset invocation labels by default
+        if hasattr(self, "honey_invocation_status"):
+            self.honey_invocation_status.setText("")
+        if hasattr(self, "honey_parent_invocation_status"):
+            self.honey_parent_invocation_status.setText("")
         if not entry:
             self.honey_sanitized_status.setText("Sanitized binary: Select an entry.")
             if hasattr(self, "honey_parent_status"):
@@ -7710,8 +8038,19 @@ class App(QMainWindow):
                 parent = self._entry_by_id(entry.parent_entry_id)
                 if parent:
                     self.honey_parent_status.setText(f"Parent run: {parent.name} ({Path(parent.binary_path).name})")
+                    # Show parent invocation details
+                    args = " ".join(parent.target_args) if parent.target_args else "(none)"
+                    mods = ", ".join(parent.module_filters) if parent.module_filters else "(none)"
+                    sudo = "on" if getattr(parent, "use_sudo", False) else "off"
+                    pre = parent.pre_run_command or "(none)"
+                    if hasattr(self, "honey_parent_invocation_status"):
+                        self.honey_parent_invocation_status.setText(
+                            f"Parent Invocation — Args: {args} · Modules: {mods} · Sudo: {sudo} · Pre-Run: {pre}"
+                        )
                 else:
                     self.honey_parent_status.setText("Parent run: Not found in history.")
+                    if hasattr(self, "honey_parent_invocation_status"):
+                        self.honey_parent_invocation_status.setText("")
             else:
                 sanitized_child = self._find_sanitized_child(entry)
                 if sanitized_child:
@@ -7720,6 +8059,8 @@ class App(QMainWindow):
                     )
                 else:
                     self.honey_parent_status.setText("Sanitized replay: Not generated.")
+                if hasattr(self, "honey_parent_invocation_status"):
+                    self.honey_parent_invocation_status.setText("")
         if prepared_label is not None:
             if entry.is_sanitized_run:
                 prepared_label.setText("Preparation: Inherited from parent entry.")
@@ -7732,6 +8073,16 @@ class App(QMainWindow):
             else:
                 prepared_label.setText("Preparation required: Use 'Prepare for HoneyProc' from the Logs tab.")
             self._update_honey_entries_label()
+
+        # Show current entry invocation details
+        args = " ".join(entry.target_args) if entry.target_args else "(none)"
+        mods = ", ".join(entry.module_filters) if entry.module_filters else "(none)"
+        sudo = "on" if getattr(entry, "use_sudo", False) else "off"
+        pre = entry.pre_run_command or "(none)"
+        if hasattr(self, "honey_invocation_status"):
+            self.honey_invocation_status.setText(
+                f"Invocation — Args: {args} · Modules: {mods} · Sudo: {sudo} · Pre-Run: {pre}"
+            )
 
     def _detect_revng(self, *, allow_prompt: bool = True) -> tuple[bool, str]:
         self._ensure_revng_wrapper_exists(quiet_if_current=True)
@@ -8173,6 +8524,19 @@ class App(QMainWindow):
             self.logs_exec_label.setText(f"Execution Logs for: {binary_name}")
         else:
             self.logs_exec_label.setText("Execution Logs for: None")
+        # Update invocation label
+        inv_label = getattr(self, "log_invocation_label", None)
+        if inv_label is not None:
+            if entry:
+                args = " ".join(entry.target_args) if entry.target_args else "(none)"
+                mods = ", ".join(entry.module_filters) if entry.module_filters else "(none)"
+                sudo = "on" if getattr(entry, "use_sudo", False) else "off"
+                pre = (entry.pre_run_command or "(none)")
+                inv_label.setText(
+                    f"Invocation — Args: {args} · Modules: {mods} · Sudo: {sudo} · Pre-Run: {pre}"
+                )
+            else:
+                inv_label.setText("")
         self.log_preview_label.setText("Instruction Trace")
         self._reset_segments_view(entry)
         if not entry or not entry.log_path:
@@ -9227,7 +9591,33 @@ class App(QMainWindow):
             self._update_honey_buttons()
             return
 
-        options_dialog = RunSanitizedOptionsDialog(self)
+        options_dialog = RunSanitizedOptionsDialog(self, default_run_with_sudo=self._last_run_with_sudo)
+        # Populate invocation preview from the parent entry
+        try:
+            parent_args = list(entry.target_args) if entry and entry.target_args else None
+        except Exception:
+            parent_args = None
+        try:
+            parent_filters = list(entry.module_filters) if entry and entry.module_filters else None
+        except Exception:
+            parent_filters = None
+        try:
+            parent_sudo = bool(getattr(entry, "use_sudo", False))
+        except Exception:
+            parent_sudo = False
+        options_dialog.set_invocation_preview(
+            args=parent_args,
+            module_filters=parent_filters,
+            use_sudo=parent_sudo,
+        )
+        # If parent has no pre-run, fall back to project default
+        try:
+            if not getattr(entry, "pre_run_command", None):
+                default_prerun = getattr(self._project_config(), "default_pre_run_command", "")
+                if default_prerun and hasattr(options_dialog, "prerun_input"):
+                    options_dialog.prerun_input.setText(default_prerun)
+        except Exception:
+            pass
         if options_dialog.exec() != QDialog.Accepted:
             self._append_console("Sanitized execution cancelled before launch.")
             return
@@ -9257,8 +9647,30 @@ class App(QMainWindow):
         )
         if dialog_result is None:
             return
-        module_filters, log_label, unique_only = dialog_result
+        module_filters, log_label, unique_only, run_with_sudo, _pre_run_unused = dialog_result
+        # Combine sudo choices from both dialogs (either enables sudo)
+        parent_use_sudo = False
+        try:
+            parent_use_sudo = bool(getattr(entry, "use_sudo", False))
+        except Exception:
+            parent_use_sudo = False
+        run_with_sudo = bool(run_with_sudo or run_options.run_with_sudo or parent_use_sudo)
+        # Use parent's module filters to mirror original invocation when available
+        try:
+            if entry and entry.module_filters:
+                module_filters = list(entry.module_filters)
+        except Exception:
+            pass
+        self._last_run_with_sudo = run_with_sudo
         log_path = str(self._project_log_path(run_label=log_label))
+        # Pre-fill sanitized dialog's pre-run with parent if present
+        try:
+            if getattr(entry, "pre_run_command", None):
+                # Set default text in the options dialog so user can edit/confirm
+                options_dialog.prerun_input.setText(str(entry.pre_run_command))
+        except Exception:
+            pass
+
         self._run_with_progress(
             str(path_obj),
             log_path,
@@ -9271,7 +9683,9 @@ class App(QMainWindow):
             is_sanitized_run=True,
             module_filters=module_filters,
             unique_only=unique_only,
+            run_with_sudo=run_with_sudo,
             metrics_options=run_options,
+            pre_run_command=run_options.pre_run_command,
         )
 
     def reveal_sanitized_binary(self) -> None:
@@ -9781,11 +10195,15 @@ class App(QMainWindow):
         binary_path: str,
         *,
         default_log_label: str | None = None,
-    ) -> tuple[list[str], str, bool] | None:
+    ) -> tuple[list[str], str, bool, bool, str | None] | None:
         modules = self._discover_binary_modules(binary_path)
         default_label = default_log_label or self._default_run_label(binary_path)
         builder = lambda value: str(self._project_log_path(run_label=(value.strip() or None)))
         display_name = Path(binary_path).name or str(binary_path)
+        # Prefer project default pre-run, falling back to last used
+        project_default_prerun = getattr(self._project_config(), "default_pre_run_command", "") or None
+        last_prerun = getattr(self, "_last_pre_run_command", None)
+        default_prerun = project_default_prerun or last_prerun
         dialog = ModuleSelectionDialog(
             self,
             display_name,
@@ -9794,6 +10212,8 @@ class App(QMainWindow):
             filename_builder=builder,
             previous_selection=self._last_module_filters,
             default_unique_only=self._last_unique_only,
+            default_run_with_sudo=self._last_run_with_sudo,
+            default_pre_run_command=default_prerun,
         )
         result = dialog.exec()
         if result != QDialog.Accepted:
@@ -9802,11 +10222,15 @@ class App(QMainWindow):
         selection = dialog.selected_modules()
         log_label = dialog.selected_log_label()
         unique_only = dialog.unique_only()
+        run_with_sudo = dialog.run_with_sudo()
+        pre_run_command = dialog.selected_pre_run_command()
         if not selection or not log_label:
             return None
         self._last_module_filters = selection
         self._last_unique_only = unique_only
-        return selection, log_label, unique_only
+        self._last_run_with_sudo = bool(run_with_sudo)
+        self._last_pre_run_command = pre_run_command
+        return selection, log_label, unique_only, bool(run_with_sudo), pre_run_command
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self._cancel_sanitization_preview()
@@ -9934,18 +10358,91 @@ class App(QMainWindow):
         run_label: str | None = None,
         module_filters: list[str] | None = None,
         unique_only: bool = False,
+        run_with_sudo: bool = False,
+        pre_run_command: str | None = None,
     ) -> None:
         binary_label = Path(binary_path).name or binary_path
         if not self._ensure_aslr_disabled_for_execution(binary_label):
             return
+        sudo_password: str | None = None
+        if run_with_sudo:
+            sudo_password = self._obtain_sudo_password(f"Enter sudo password to run {binary_label}:")
+            if not sudo_password:
+                self._append_console("Run cancelled; sudo password not provided.")
+                return
+        extra_args: list[str] | None = None
         try:
+            binary_name = Path(binary_path).name.lower()
+            if binary_name == "nginx":
+                extra_args = ["-g", "daemon off; master_process off;"]
+            elif binary_name == "sshd":
+                # Run sshd in foreground mode so it stays active under PIN
+                extra_args = ["-D", "-f", "/tmp/sshd_config_honeypot", "-p", "2222"]
+        except Exception:
+            extra_args = None
+        try:
+            # Execute optional pre-run command or script before launching PIN
+            if pre_run_command:
+                from pathlib import Path as _Path
+                import subprocess as _subprocess
+                import os as _os
+                cmd: list[str]
+                try:
+                    _p = _Path(pre_run_command)
+                    if _p.exists() and _p.is_file():
+                        cmd = ["bash", str(_p)]
+                    else:
+                        cmd = ["bash", "-lc", pre_run_command]
+                except Exception:
+                    cmd = ["bash", "-lc", pre_run_command]
+                if run_with_sudo and sudo_password:
+                    cmd = ["sudo", "-S", "-p", "", *cmd]
+                proc = _subprocess.Popen(
+                    cmd,
+                    stdout=_subprocess.PIPE,
+                    stderr=_subprocess.STDOUT,
+                    stdin=_subprocess.PIPE if (run_with_sudo and sudo_password) else None,
+                    text=True,
+                    bufsize=1,
+                    cwd=_os.getcwd(),
+                )
+                if run_with_sudo and sudo_password and proc.stdin is not None:
+                    try:
+                        proc.stdin.write(sudo_password + "\n")
+                        proc.stdin.flush()
+                    except BrokenPipeError:
+                        pass
+                    finally:
+                        try:
+                            proc.stdin.close()
+                        except OSError:
+                            pass
+                assert proc.stdout is not None
+                for line in proc.stdout:
+                    clean = line.rstrip()
+                    if clean:
+                        self._append_console(clean)
+                proc.wait()
+                if proc.returncode != 0:
+                    raise RuntimeError("Pre-run command failed with non-zero exit status")
             result_path = self.controller.run_binary(
                 binary_path,
                 log_path=log_path,
                 module_filters=module_filters,
                 unique_only=unique_only,
+                use_sudo=bool(run_with_sudo),
+                sudo_password=sudo_password,
+                extra_target_args=extra_args,
             )
-            self._on_run_success(binary_path, str(result_path), run_label=run_label)
+            self._on_run_success(
+                binary_path,
+                str(result_path),
+                run_label=run_label,
+                target_args=extra_args,
+                use_sudo=bool(run_with_sudo),
+                module_filters=module_filters,
+                pre_run_command=pre_run_command,
+            )
         except Exception as exc:
             self._on_run_failure(exc)
 
@@ -9963,11 +10460,31 @@ class App(QMainWindow):
         is_sanitized_run: bool = False,
         module_filters: list[str] | None = None,
         unique_only: bool = False,
+        run_with_sudo: bool = False,
         metrics_options: RunSanitizedOptions | None = None,
+        pre_run_command: str | None = None,
     ) -> None:
         binary_label = Path(binary_path).name or binary_path
         if not self._ensure_aslr_disabled_for_execution(binary_label):
             return
+        sudo_password: str | None = None
+        if run_with_sudo:
+            sudo_password = self._obtain_sudo_password(f"Enter sudo password to run {binary_label}:")
+            if not sudo_password:
+                self._append_console("Run cancelled; sudo password not provided.")
+                return
+        extra_args: list[str] | None = None
+        try:
+            binary_name = Path(binary_path).name.lower()
+            if binary_name == "nginx":
+                extra_args = ["-g", "daemon off; master_process off;"]
+            elif binary_name == "sshd":
+                # Run sshd in foreground mode so it stays active under PIN
+                extra_args = ["-D", "-f", "/tmp/sshd_config_honeypot", "-p", "2222"]
+        except Exception:
+            extra_args = None
+
+            # Special handling for sshd - pass port as argument
         self._run_stop_requested = False
         dialog = RunProgressDialog(
             self,
@@ -9980,6 +10497,10 @@ class App(QMainWindow):
             log_path,
             module_filters=module_filters,
             unique_only=unique_only,
+            use_sudo=bool(run_with_sudo),
+            sudo_password=sudo_password,
+            extra_target_args=extra_args,
+            pre_run_command=pre_run_command,
         )
         thread = QThread(self)
         worker.moveToThread(thread)
@@ -10001,6 +10522,9 @@ class App(QMainWindow):
             "module_filters": module_filters,
             "unique_only": unique_only,
             "metrics_options": metrics_options,
+            "target_args": extra_args,
+            "use_sudo": bool(run_with_sudo),
+            "pre_run_command": pre_run_command,
         }
 
         worker.succeeded.connect(self._handle_run_worker_success)
@@ -10034,6 +10558,9 @@ class App(QMainWindow):
         parent_entry_id = params.get("parent_entry_id")
         sanitized_binary_path = params.get("sanitized_binary_path")
         is_sanitized_run = params.get("is_sanitized_run", False)
+        target_args = params.get("target_args")
+        use_sudo = bool(params.get("use_sudo", False))
+        pre_run_command = params.get("pre_run_command")
         metrics_options: RunSanitizedOptions | None = params.get("metrics_options")
         dialog = self._current_run_dialog
         if dialog:
@@ -10048,6 +10575,10 @@ class App(QMainWindow):
                 parent_entry_id=parent_entry_id,
                 sanitized_binary_path=sanitized_binary_path,
                 is_sanitized_run=is_sanitized_run,
+                target_args=target_args,
+                use_sudo=use_sudo,
+                module_filters=params.get("module_filters"),
+                pre_run_command=pre_run_command,
             )
         if metrics_options and any(
             [
@@ -10110,6 +10641,10 @@ class App(QMainWindow):
         parent_entry_id: str | None = None,
         sanitized_binary_path: str | None = None,
         is_sanitized_run: bool = False,
+        target_args: list[str] | None = None,
+        use_sudo: bool = False,
+        module_filters: list[str] | None = None,
+        pre_run_command: str | None = None,
     ) -> None:
         binary_name = Path(binary_path).name or binary_path
         self._append_console(
@@ -10123,10 +10658,16 @@ class App(QMainWindow):
                 parent_entry_id=parent_entry_id,
                 sanitized_binary_path=sanitized_binary_path,
                 is_sanitized_run=is_sanitized_run,
+                target_args=target_args,
+                use_sudo=use_sudo,
+                module_filters=module_filters,
+                pre_run_command=pre_run_command,
             )
 
     def _on_run_failure(self, error: Exception | str) -> None:
         message = str(error)
+        if self._password_error_requires_retry(message):
+            self._clear_cached_sudo_password()
         self._append_console(f"Error running binary: {message}")
         QMessageBox.critical(self, "Run failed", message)
 

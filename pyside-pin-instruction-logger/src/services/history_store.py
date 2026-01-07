@@ -68,9 +68,19 @@ class HistoryStore:
                     sanitized_total_instructions=sanitized_total,
                     sanitized_preserved_instructions=sanitized_preserved,
                     sanitized_nopped_instructions=sanitized_nopped,
+                    target_args=raw.get("target_args") or None,
+                    use_sudo=bool(raw.get("use_sudo", False)),
+                    module_filters=raw.get("module_filters") or None,
+                    pre_run_command=raw.get("pre_run_command") or None,
                 )
             )
         return entries
+
+    def list_projects(self) -> list[str]:
+        data = self._read_all()
+        if not isinstance(data, dict):
+            return []
+        return list(data.keys())
 
     def save_project(self, project: str, entries: list[RunEntry]) -> None:
         data = self._read_all()
@@ -120,6 +130,10 @@ class HistoryStore:
             "sanitized_total_instructions": int(getattr(entry, "sanitized_total_instructions", 0) or 0),
             "sanitized_preserved_instructions": int(getattr(entry, "sanitized_preserved_instructions", 0) or 0),
             "sanitized_nopped_instructions": int(getattr(entry, "sanitized_nopped_instructions", 0) or 0),
+            "target_args": list(entry.target_args) if entry.target_args else None,
+            "use_sudo": bool(getattr(entry, "use_sudo", False)),
+            "module_filters": list(entry.module_filters) if entry.module_filters else None,
+            "pre_run_command": entry.pre_run_command or None,
         }
 
     def _read_all(self) -> dict[str, list[dict[str, Any]]]:

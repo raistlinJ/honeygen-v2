@@ -20,6 +20,8 @@ class ProjectConfig:
     binary_path: str = ""
     tool_path: str = str(DEFAULT_TOOL_PATH)
     revng_docker_image: str = "revng/revng"
+    # Default pre-run command/script to execute before target launch
+    default_pre_run_command: str = ""
 
     # Sanitization preferences (GUI defaults). Keep conservative values by default.
     sanitize_runnable_first: bool = True
@@ -104,6 +106,7 @@ class ConfigManager:
             binary_path=fallback.binary_path,
             tool_path=fallback.tool_path,
             revng_docker_image=fallback.revng_docker_image,
+            default_pre_run_command="",
         )
         if isinstance(raw, dict):
             for key, value in raw.items():

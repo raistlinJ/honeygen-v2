@@ -7,6 +7,7 @@ import subprocess
 import os
 import shutil
 from typing import Callable, Sequence
+import signal
 
 PIN_ROOT_DEFAULT = Path("/home/researchdev/Downloads/pin4")
 
@@ -31,6 +32,7 @@ class PinRunner:
         self.default_log.parent.mkdir(parents=True, exist_ok=True)
         self._tool_trace_name = "instruction_log.txt"
         self._process: subprocess.Popen[str] | None = None
+        self._pgid: int | None = None
 
     def run(
         self,
@@ -43,6 +45,8 @@ class PinRunner:
         timeout: float | None = None,
         on_output: Callable[[str], None] | None = None,
         unique_only: bool = False,
+        use_sudo: bool = False,
+        sudo_password: str | None = None,
     ) -> Path:
         binary = Path(binary_path)
         if not binary.exists():
@@ -71,6 +75,11 @@ class PinRunner:
         if extra_target_args:
             command.extend(list(extra_target_args))
 
+        if use_sudo:
+            if not sudo_password:
+                raise RuntimeError("Sudo password not provided.")
+            command = ["sudo", "-S", "-p", "", *command]
+
         if on_output:
             on_output(f"Launching PIN for {binary.name}...")
 
@@ -83,11 +92,30 @@ class PinRunner:
             command,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
+            stdin=subprocess.PIPE if use_sudo else None,
             text=True,
             bufsize=1,
             env=combined_env,
             cwd=self.project_root,
+            preexec_fn=os.setsid,
         )
+
+        try:
+            self._pgid = os.getpgid(self._process.pid)
+        except Exception:
+            self._pgid = None
+
+        if use_sudo and self._process.stdin is not None:
+            try:
+                self._process.stdin.write(sudo_password + "\n")
+                self._process.stdin.flush()
+            except BrokenPipeError:
+                pass
+            finally:
+                try:
+                    self._process.stdin.close()
+                except OSError:
+                    pass
         stdout_lines: list[str] = []
         assert self._process.stdout is not None
         for line in self._process.stdout:
@@ -121,13 +149,40 @@ class PinRunner:
         return log_file
 
     def stop(self) -> None:
-        if self._process and self._process.poll() is None:
-            self._process.terminate()
+        proc = self._process
+        if not proc:
+            return
+        if proc.poll() is not None:
+            return
+        # Try graceful stop of the whole process group first.
+        pgid = self._pgid
+        if pgid is not None:
             try:
-                self._process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self._process.kill()
-                self._process.wait()
+                os.killpg(pgid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        else:
+            try:
+                proc.terminate()
+            except ProcessLookupError:
+                pass
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            # Escalate to SIGKILL on the process group, then the process.
+            if pgid is not None:
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                proc.wait(timeout=3)
+            except Exception:
+                pass
 
     def _ensure_pin_executable(self) -> Path:
         if not self.pin_bin.exists():

@@ -28,6 +28,12 @@ class RunEntry:
     sanitized_total_instructions: int = 0
     sanitized_preserved_instructions: int = 0
     sanitized_nopped_instructions: int = 0
+    # Invocation details
+    target_args: list[str] | None = None
+    use_sudo: bool = False
+    module_filters: list[str] | None = None
+    # Optional pre-run setup command or script path
+    pre_run_command: str | None = None
 
     def label(self) -> str:
         prefix = "[SAN] " if self.is_sanitized_run else ""
