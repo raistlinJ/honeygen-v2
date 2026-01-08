@@ -44,6 +44,9 @@ pyside-pin-instruction-logger
    uv sync
    ```
 
+   Note: running `python3 src/app.py` uses your *system* Python, which may not have GUI deps like `PySide6` installed.
+   Use `uv run ...` (recommended) or the project virtualenv Python.
+
 3. **Ensure the Intel PIN kit is installed:**
    Extract Intel PIN 4 to `/home/researchdev/Downloads/pin4` (or set `PIN_ROOT` to another location). The helper scripts default to that path.
 
@@ -55,6 +58,26 @@ pyside-pin-instruction-logger
 5. **Run the application:**
    ```
    uv run python src/app.py
+   ```
+
+   Or use the top-level launcher (avoids `PYTHONPATH` quirks and keeps imports consistent):
+   ```
+   uv run python run_app.py
+   ```
+
+   If you prefer to bypass `uv`, run via the venv interpreter directly:
+   ```
+   ./.venv_py312/bin/python src/app.py
+   ```
+
+   Or via the launcher:
+   ```
+   ./.venv_py312/bin/python run_app.py
+   ```
+
+   If you want to import modules from `src/` in a REPL/script, set `PYTHONPATH=src`:
+   ```
+   PYTHONPATH=src ./.venv_py312/bin/python -c "import app; print('ok')"
    ```
 
 ## Usage

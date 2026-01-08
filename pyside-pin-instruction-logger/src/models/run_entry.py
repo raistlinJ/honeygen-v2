@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+
+from models.sanitized_output import SanitizedBinaryOutput
 
 
 def _display_name(binary_path: str) -> str:
@@ -18,6 +20,7 @@ class RunEntry:
     log_path: str
     timestamp: datetime
     sanitized_binary_path: str | None = None
+    sanitized_outputs: list[SanitizedBinaryOutput] = field(default_factory=list)
     parent_entry_id: str | None = None
     is_sanitized_run: bool = False
     prepared_segments: list[tuple[int, int]] | None = None

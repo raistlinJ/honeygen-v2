@@ -8,6 +8,7 @@ import os
 import shutil
 from typing import Callable, Sequence
 import signal
+import threading
 
 PIN_ROOT_DEFAULT = Path("/home/researchdev/Downloads/pin4")
 
@@ -71,9 +72,11 @@ class PinRunner:
         if unique_only:
             tool_args.extend(["-unique_only", "1"])
 
+        effective_target_args = list(extra_target_args or [])
+
         command: list[str] = [str(pin_exe), "-t", str(tool), *tool_args, "--", str(binary)]
-        if extra_target_args:
-            command.extend(list(extra_target_args))
+        if effective_target_args:
+            command.extend(effective_target_args)
 
         if use_sudo:
             if not sudo_password:
@@ -82,6 +85,54 @@ class PinRunner:
 
         if on_output:
             on_output(f"Launching PIN for {binary.name}...")
+
+        if on_output:
+            on_output(f"[debug] cwd={self.project_root}")
+            on_output(f"[debug] pin={pin_exe}")
+            on_output(f"[debug] tool={tool}")
+            on_output(f"[debug] target={binary}")
+            on_output(f"[debug] command={' '.join(command)}")
+
+            # If the target args include an sshd-style config flag, report file diagnostics.
+            config_path: Path | None = None
+            args_list = list(effective_target_args or [])
+            for idx, token in enumerate(args_list):
+                if token == "-f" and (idx + 1) < len(args_list):
+                    config_path = Path(args_list[idx + 1])
+                    break
+                if token.startswith("-f") and len(token) > 2:
+                    config_path = Path(token[2:])
+                    break
+            if config_path is not None:
+                # Resolve relative paths against the runner cwd (project root).
+                resolved = (self.project_root / config_path).resolve() if not config_path.is_absolute() else config_path
+                try:
+                    if str(config_path) == "/tmp/sshd_config_honeypot":
+                        readable = resolved.exists() and os.access(str(resolved), os.R_OK)
+                        if not readable:
+                            on_output(
+                                "[debug] warning: legacy sshd config '/tmp/sshd_config_honeypot' is not readable; "
+                                "runner will not remap args (use the original-location run option or update args)."
+                            )
+                except Exception:
+                    pass
+                try:
+                    st = resolved.stat()
+                    on_output(
+                        "[debug] sshd_config="
+                        f"{resolved} mode={oct(st.st_mode & 0o777)} uid={st.st_uid} gid={st.st_gid} size={st.st_size}"
+                    )
+                except Exception as exc:
+                    on_output(f"[debug] sshd_config={resolved} stat_failed={exc}")
+                try:
+                    data = resolved.read_bytes()
+                    line1 = data.splitlines()[0] if data.splitlines() else b""
+                    nul_count = data.count(b"\x00")
+                    # Keep output short but useful.
+                    preview = line1[:200]
+                    on_output(f"[debug] sshd_config_line1={preview!r} nul_count={nul_count}")
+                except Exception as exc:
+                    on_output(f"[debug] sshd_config_read_failed={exc}")
 
         combined_env = os.environ.copy()
         combined_env.setdefault("PIN_ROOT", str(self.pin_root))
@@ -99,6 +150,21 @@ class PinRunner:
             cwd=self.project_root,
             preexec_fn=os.setsid,
         )
+
+        timeout_timer: threading.Timer | None = None
+        timed_out = False
+        if timeout and timeout > 0:
+            def _expire() -> None:
+                nonlocal timed_out
+                timed_out = True
+                try:
+                    self.stop()
+                except Exception:
+                    pass
+
+            timeout_timer = threading.Timer(float(timeout), _expire)
+            timeout_timer.daemon = True
+            timeout_timer.start()
 
         try:
             self._pgid = os.getpgid(self._process.pid)
@@ -118,13 +184,25 @@ class PinRunner:
                     pass
         stdout_lines: list[str] = []
         assert self._process.stdout is not None
-        for line in self._process.stdout:
-            clean_line = line.rstrip()
-            if clean_line:
-                stdout_lines.append(clean_line)
-            if on_output and clean_line:
-                on_output(clean_line)
-        self._process.wait(timeout=timeout)
+        try:
+            for line in self._process.stdout:
+                clean_line = line.rstrip()
+                if clean_line:
+                    stdout_lines.append(clean_line)
+                if on_output and clean_line:
+                    on_output(clean_line)
+        finally:
+            if timeout_timer is not None:
+                try:
+                    timeout_timer.cancel()
+                except Exception:
+                    pass
+
+        self._process.wait()
+
+        if timed_out:
+            stdout_msg = "\n".join(stdout_lines) if stdout_lines else "(no output)"
+            raise RuntimeError(f"PIN run timed out after {timeout}s. Output so far:\n{stdout_msg}")
 
         if self._process.returncode != 0:
             stdout_msg = "\n".join(stdout_lines) if stdout_lines else "Unknown error"

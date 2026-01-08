@@ -7796,12 +7796,694 @@
   ],
   "sshd": [
     {
-      "entry_id": "05b05034-ac0b-4b0c-8f38-6fd11fbd3417",
-      "name": "sshd @ 2026-01-07 15:45:30",
+      "entry_id": "26da60dc-9adc-4d36-8d8d-975284caa7c0",
+      "name": "sshd @ 2026-01-08 12:02:46",
       "binary_path": "/usr/sbin/sshd",
-      "log_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/sshd/instruction_log_sshd_2026-01-07_15_45_30.txt",
-      "timestamp": "2026-01-07T15:45:54.574019",
+      "log_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/sshd/instruction_log_sshd_2026-01-08_12_02_46.txt",
+      "timestamp": "2026-01-08T12:03:08.733429",
+      "sanitized_binary_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/sshd/sshd_2026-01-08_12_02_46/sanitized/sshd_gap10000_pad0_icf0_jt0",
+      "sanitized_outputs": [
+        {
+          "output_id": "13737cf4-8cb9-4a2d-9329-366d26bf2d73",
+          "output_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/sshd/sshd_2026-01-08_12_02_46/sanitized/sshd_gap7000_pad0_icf0_jt0",
+          "works": null,
+          "segment_gap": 28672,
+          "segment_padding": 0,
+          "icf_window": 0,
+          "jumptable_window": 0,
+          "total_instructions": 44443,
+          "preserved_instructions": 18897,
+          "nopped_instructions": 25546,
+          "generated_at": "2026-01-08T15:22:05.550339"
+        },
+        {
+          "output_id": "fdd5cba6-8da4-4f93-95e1-7e494cbf2d9b",
+          "output_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/sshd/sshd_2026-01-08_12_02_46/sanitized/sshd_gap8000_pad0_icf0_jt0",
+          "works": null,
+          "segment_gap": 32768,
+          "segment_padding": 0,
+          "icf_window": 0,
+          "jumptable_window": 0,
+          "total_instructions": 44443,
+          "preserved_instructions": 25725,
+          "nopped_instructions": 18718,
+          "generated_at": "2026-01-08T15:22:05.690210"
+        },
+        {
+          "output_id": "cff83318-0656-4680-8b7f-2cc2f9344e67",
+          "output_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/sshd/sshd_2026-01-08_12_02_46/sanitized/sshd_gap9000_pad0_icf0_jt0",
+          "works": null,
+          "segment_gap": 36864,
+          "segment_padding": 0,
+          "icf_window": 0,
+          "jumptable_window": 0,
+          "total_instructions": 44443,
+          "preserved_instructions": 25725,
+          "nopped_instructions": 18718,
+          "generated_at": "2026-01-08T15:22:05.837437"
+        },
+        {
+          "output_id": "84a71f60-c953-453a-ace0-4456431139b0",
+          "output_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/sshd/sshd_2026-01-08_12_02_46/sanitized/sshd_gapa000_pad0_icf0_jt0",
+          "works": null,
+          "segment_gap": 40960,
+          "segment_padding": 0,
+          "icf_window": 0,
+          "jumptable_window": 0,
+          "total_instructions": 44443,
+          "preserved_instructions": 34659,
+          "nopped_instructions": 9784,
+          "generated_at": "2026-01-08T15:22:05.959913"
+        },
+        {
+          "output_id": "32d0ec87-6abf-4ec4-be26-0467e032fd1b",
+          "output_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/sshd/sshd_2026-01-08_12_02_46/sanitized/sshd_gapb000_pad0_icf0_jt0",
+          "works": null,
+          "segment_gap": 45056,
+          "segment_padding": 0,
+          "icf_window": 0,
+          "jumptable_window": 0,
+          "total_instructions": 44443,
+          "preserved_instructions": 44383,
+          "nopped_instructions": 60,
+          "generated_at": "2026-01-08T15:22:06.071146"
+        },
+        {
+          "output_id": "367fa8fa-9d02-4478-be9a-57efab5d2f2b",
+          "output_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/sshd/sshd_2026-01-08_12_02_46/sanitized/sshd_gapc000_pad0_icf0_jt0",
+          "works": null,
+          "segment_gap": 49152,
+          "segment_padding": 0,
+          "icf_window": 0,
+          "jumptable_window": 0,
+          "total_instructions": 44443,
+          "preserved_instructions": 44383,
+          "nopped_instructions": 60,
+          "generated_at": "2026-01-08T15:22:06.189321"
+        },
+        {
+          "output_id": "e66bb042-ebce-47c5-99cd-d89af272d6d5",
+          "output_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/sshd/sshd_2026-01-08_12_02_46/sanitized/sshd_gapd000_pad0_icf0_jt0",
+          "works": null,
+          "segment_gap": 53248,
+          "segment_padding": 0,
+          "icf_window": 0,
+          "jumptable_window": 0,
+          "total_instructions": 44443,
+          "preserved_instructions": 44383,
+          "nopped_instructions": 60,
+          "generated_at": "2026-01-08T15:22:06.308893"
+        },
+        {
+          "output_id": "0b2a0514-560d-4595-9ec8-3910c67648e1",
+          "output_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/sshd/sshd_2026-01-08_12_02_46/sanitized/sshd_gape000_pad0_icf0_jt0",
+          "works": false,
+          "segment_gap": 57344,
+          "segment_padding": 0,
+          "icf_window": 0,
+          "jumptable_window": 0,
+          "total_instructions": 44443,
+          "preserved_instructions": 44383,
+          "nopped_instructions": 60,
+          "generated_at": "2026-01-08T15:22:06.441789"
+        },
+        {
+          "output_id": "fd31845d-4ac5-469c-a47a-e147c49ff1a0",
+          "output_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/sshd/sshd_2026-01-08_12_02_46/sanitized/sshd_gapf000_pad0_icf0_jt0",
+          "works": null,
+          "segment_gap": 61440,
+          "segment_padding": 0,
+          "icf_window": 0,
+          "jumptable_window": 0,
+          "total_instructions": 44443,
+          "preserved_instructions": 44383,
+          "nopped_instructions": 60,
+          "generated_at": "2026-01-08T15:22:06.580077"
+        },
+        {
+          "output_id": "e954a2c0-267c-4fc7-9b91-d15b270e6194",
+          "output_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/sshd/sshd_2026-01-08_12_02_46/sanitized/sshd_gap10000_pad0_icf0_jt0",
+          "works": false,
+          "segment_gap": 65536,
+          "segment_padding": 0,
+          "icf_window": 0,
+          "jumptable_window": 0,
+          "total_instructions": 44443,
+          "preserved_instructions": 44383,
+          "nopped_instructions": 60,
+          "generated_at": "2026-01-08T15:22:06.725259"
+        }
+      ],
+      "parent_entry_id": null,
+      "is_sanitized_run": false,
+      "prepared_segments": [
+        {
+          "start": 93824992264192,
+          "end": 93824992264218
+        },
+        {
+          "start": 93824992268272,
+          "end": 93824992268276
+        },
+        {
+          "start": 93824992268688,
+          "end": 93824992268708
+        },
+        {
+          "start": 93824992268784,
+          "end": 93824992268788
+        },
+        {
+          "start": 93824992268928,
+          "end": 93824992268932
+        },
+        {
+          "start": 93824992268976,
+          "end": 93824992268980
+        },
+        {
+          "start": 93824992269120,
+          "end": 93824992269124
+        },
+        {
+          "start": 93824992269360,
+          "end": 93824992269364
+        },
+        {
+          "start": 93824992269424,
+          "end": 93824992269428
+        },
+        {
+          "start": 93824992269568,
+          "end": 93824992269572
+        },
+        {
+          "start": 93824992270432,
+          "end": 93824992270436
+        },
+        {
+          "start": 93824992270528,
+          "end": 93824992270532
+        },
+        {
+          "start": 93824992270592,
+          "end": 93824992270596
+        },
+        {
+          "start": 93824992270816,
+          "end": 93824992270820
+        },
+        {
+          "start": 93824992271392,
+          "end": 93824992271396
+        },
+        {
+          "start": 93824992271616,
+          "end": 93824992271620
+        },
+        {
+          "start": 93824992271856,
+          "end": 93824992271860
+        },
+        {
+          "start": 93824992272032,
+          "end": 93824992272036
+        },
+        {
+          "start": 93824992272080,
+          "end": 93824992272084
+        },
+        {
+          "start": 93824992272160,
+          "end": 93824992272653
+        },
+        {
+          "start": 93824992272748,
+          "end": 93824992273176
+        },
+        {
+          "start": 93824992273250,
+          "end": 93824992273342
+        },
+        {
+          "start": 93824992273480,
+          "end": 93824992273847
+        },
+        {
+          "start": 93824992274004,
+          "end": 93824992274046
+        },
+        {
+          "start": 93824992274551,
+          "end": 93824992274581
+        },
+        {
+          "start": 93824992274639,
+          "end": 93824992274692
+        },
+        {
+          "start": 93824992275069,
+          "end": 93824992275132
+        },
+        {
+          "start": 93824992275357,
+          "end": 93824992275367
+        },
+        {
+          "start": 93824992275579,
+          "end": 93824992275593
+        },
+        {
+          "start": 93824992275713,
+          "end": 93824992275749
+        },
+        {
+          "start": 93824992278573,
+          "end": 93824992278649
+        },
+        {
+          "start": 93824992286784,
+          "end": 93824992286815
+        },
+        {
+          "start": 93824992286880,
+          "end": 93824992286936
+        },
+        {
+          "start": 93824992287008,
+          "end": 93824992287012
+        },
+        {
+          "start": 93824992329040,
+          "end": 93824992329145
+        },
+        {
+          "start": 93824992329728,
+          "end": 93824992329831
+        },
+        {
+          "start": 93824992329872,
+          "end": 93824992330280
+        },
+        {
+          "start": 93824992330339,
+          "end": 93824992330347
+        },
+        {
+          "start": 93824992330400,
+          "end": 93824992330495
+        },
+        {
+          "start": 93824992331328,
+          "end": 93824992331366
+        },
+        {
+          "start": 93824992331424,
+          "end": 93824992331431
+        },
+        {
+          "start": 93824992331586,
+          "end": 93824992331598
+        },
+        {
+          "start": 93824992364096,
+          "end": 93824992364327
+        },
+        {
+          "start": 93824992402656,
+          "end": 93824992402773
+        },
+        {
+          "start": 93824992412368,
+          "end": 93824992412412
+        },
+        {
+          "start": 93824992412560,
+          "end": 93824992412616
+        },
+        {
+          "start": 93824992417168,
+          "end": 93824992417277
+        },
+        {
+          "start": 93824992427728,
+          "end": 93824992427943
+        },
+        {
+          "start": 93824992438064,
+          "end": 93824992438238
+        },
+        {
+          "start": 93824992438279,
+          "end": 93824992438353
+        },
+        {
+          "start": 93824992438416,
+          "end": 93824992438432
+        },
+        {
+          "start": 93824992438473,
+          "end": 93824992438746
+        },
+        {
+          "start": 93824992438784,
+          "end": 93824992438813
+        },
+        {
+          "start": 93824992438881,
+          "end": 93824992438890
+        },
+        {
+          "start": 93824992438928,
+          "end": 93824992438944
+        },
+        {
+          "start": 93824992439016,
+          "end": 93824992439021
+        },
+        {
+          "start": 93824992439056,
+          "end": 93824992439060
+        },
+        {
+          "start": 93824992439093,
+          "end": 93824992439226
+        },
+        {
+          "start": 93824992455504,
+          "end": 93824992455588
+        },
+        {
+          "start": 93824992461120,
+          "end": 93824992461296
+        },
+        {
+          "start": 93824992461346,
+          "end": 93824992461815
+        },
+        {
+          "start": 93824992464752,
+          "end": 93824992464794
+        }
+      ],
+      "prepared_at": "2026-01-08T12:03:11.752866",
+      "binary_offset": 93824992231424,
+      "trace_address_count": 1207,
+      "binary_instruction_count": 46178,
+      "sanitized_total_instructions": 44443,
+      "sanitized_preserved_instructions": 44383,
+      "sanitized_nopped_instructions": 60,
+      "target_args": [
+        "-D",
+        "-f",
+        "projects/sshd/runtime/sshd_config_honeypot",
+        "-p",
+        "2222"
+      ],
+      "use_sudo": true,
+      "module_filters": [
+        "sshd"
+      ],
+      "pre_run_command": "scripts/setup_sshd_honeypot.sh"
+    },
+    {
+      "entry_id": "8a157e97-da1f-4e57-9ba0-a9e9ad95ba87",
+      "name": "sshd @ 2026-01-08 12:02:46 (Sanitized)",
+      "binary_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/sshd/sshd_2026-01-08_12_02_46/sanitized/sshd",
+      "log_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/sshd/instruction_log_sshd_2026-01-08_12_02_46_Sanitized.txt",
+      "timestamp": "2026-01-08T12:04:07.333475",
+      "sanitized_binary_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/sshd/sshd_2026-01-08_12_02_46/sanitized/sshd",
+      "sanitized_outputs": [
+        {
+          "output_id": "e2f04619-51d5-4ab2-86fe-d2cc7bba8bd6",
+          "output_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/sshd/sshd_2026-01-08_12_02_46/sanitized/sshd",
+          "works": null,
+          "segment_gap": 0,
+          "segment_padding": 0,
+          "icf_window": 0,
+          "jumptable_window": 0,
+          "total_instructions": 0,
+          "preserved_instructions": 0,
+          "nopped_instructions": 0,
+          "generated_at": null
+        }
+      ],
+      "parent_entry_id": "26da60dc-9adc-4d36-8d8d-975284caa7c0",
+      "is_sanitized_run": true,
+      "prepared_segments": [],
+      "prepared_at": null,
+      "binary_offset": 0,
+      "trace_address_count": 0,
+      "binary_instruction_count": 0,
+      "sanitized_total_instructions": 0,
+      "sanitized_preserved_instructions": 0,
+      "sanitized_nopped_instructions": 0,
+      "target_args": [
+        "-D",
+        "-f",
+        "projects/sshd/runtime/sshd_config_honeypot",
+        "-p",
+        "2222"
+      ],
+      "use_sudo": true,
+      "module_filters": [
+        "sshd"
+      ],
+      "pre_run_command": "scripts/setup_sshd_honeypot.sh"
+    },
+    {
+      "entry_id": "6ff2dd7c-f6bc-4e28-a918-0f8b643102c9",
+      "name": "sshd @ 2026-01-08 12:02:46 (Sanitized)",
+      "binary_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/sshd/sshd_2026-01-08_12_02_46/sanitized/sshd",
+      "log_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/sshd/instruction_log_sshd_2026-01-08_12_02_46_Sanitized.txt",
+      "timestamp": "2026-01-08T12:06:57.593590",
+      "sanitized_binary_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/sshd/sshd_2026-01-08_12_02_46/sanitized/sshd",
+      "sanitized_outputs": [
+        {
+          "output_id": "27ed7794-1c09-4c42-8077-5e1632bfb351",
+          "output_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/sshd/sshd_2026-01-08_12_02_46/sanitized/sshd",
+          "works": null,
+          "segment_gap": 0,
+          "segment_padding": 0,
+          "icf_window": 0,
+          "jumptable_window": 0,
+          "total_instructions": 0,
+          "preserved_instructions": 0,
+          "nopped_instructions": 0,
+          "generated_at": null
+        }
+      ],
+      "parent_entry_id": "26da60dc-9adc-4d36-8d8d-975284caa7c0",
+      "is_sanitized_run": true,
+      "prepared_segments": [],
+      "prepared_at": null,
+      "binary_offset": 0,
+      "trace_address_count": 0,
+      "binary_instruction_count": 0,
+      "sanitized_total_instructions": 0,
+      "sanitized_preserved_instructions": 0,
+      "sanitized_nopped_instructions": 0,
+      "target_args": [
+        "-D",
+        "-f",
+        "projects/sshd/runtime/sshd_config_honeypot",
+        "-p",
+        "2222"
+      ],
+      "use_sudo": true,
+      "module_filters": [
+        "sshd"
+      ],
+      "pre_run_command": "scripts/setup_sshd_honeypot.sh"
+    },
+    {
+      "entry_id": "19ee9d68-a7a0-4d8b-9a6e-c87edafd711d",
+      "name": "sshd @ 2026-01-08 12:02:46 (Sanitized)",
+      "binary_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/sshd/sshd_2026-01-08_12_02_46/sanitized/sshd",
+      "log_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/sshd/instruction_log_sshd_2026-01-08_12_02_46_Sanitized.txt",
+      "timestamp": "2026-01-08T12:29:54.579142",
+      "sanitized_binary_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/sshd/sshd_2026-01-08_12_02_46/sanitized/sshd",
+      "sanitized_outputs": [
+        {
+          "output_id": "d47a82d7-d117-42af-b4d9-26e65b503af9",
+          "output_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/sshd/sshd_2026-01-08_12_02_46/sanitized/sshd",
+          "works": null,
+          "segment_gap": 0,
+          "segment_padding": 0,
+          "icf_window": 0,
+          "jumptable_window": 0,
+          "total_instructions": 0,
+          "preserved_instructions": 0,
+          "nopped_instructions": 0,
+          "generated_at": null
+        }
+      ],
+      "parent_entry_id": "26da60dc-9adc-4d36-8d8d-975284caa7c0",
+      "is_sanitized_run": true,
+      "prepared_segments": [],
+      "prepared_at": null,
+      "binary_offset": 0,
+      "trace_address_count": 0,
+      "binary_instruction_count": 0,
+      "sanitized_total_instructions": 0,
+      "sanitized_preserved_instructions": 0,
+      "sanitized_nopped_instructions": 0,
+      "target_args": [
+        "-D",
+        "-f",
+        "projects/sshd/runtime/sshd_config_honeypot",
+        "-p",
+        "2222"
+      ],
+      "use_sudo": true,
+      "module_filters": [
+        "sshd"
+      ],
+      "pre_run_command": "scripts/setup_sshd_honeypot.sh"
+    },
+    {
+      "entry_id": "33379c13-df25-46cd-a1a4-b183c2057445",
+      "name": "sshd @ 2026-01-08 12:02:46 (Sanitized)",
+      "binary_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/sshd/sshd_2026-01-08_12_02_46/sanitized/sshd",
+      "log_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/sshd/instruction_log_sshd_2026-01-08_12_02_46_Sanitized.txt",
+      "timestamp": "2026-01-08T12:32:28.900820",
+      "sanitized_binary_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/sshd/sshd_2026-01-08_12_02_46/sanitized/sshd",
+      "sanitized_outputs": [
+        {
+          "output_id": "104b5a25-6682-440d-afa9-4f1d25a55ada",
+          "output_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/sshd/sshd_2026-01-08_12_02_46/sanitized/sshd",
+          "works": null,
+          "segment_gap": 0,
+          "segment_padding": 0,
+          "icf_window": 0,
+          "jumptable_window": 0,
+          "total_instructions": 0,
+          "preserved_instructions": 0,
+          "nopped_instructions": 0,
+          "generated_at": null
+        }
+      ],
+      "parent_entry_id": "26da60dc-9adc-4d36-8d8d-975284caa7c0",
+      "is_sanitized_run": true,
+      "prepared_segments": [],
+      "prepared_at": null,
+      "binary_offset": 0,
+      "trace_address_count": 0,
+      "binary_instruction_count": 0,
+      "sanitized_total_instructions": 0,
+      "sanitized_preserved_instructions": 0,
+      "sanitized_nopped_instructions": 0,
+      "target_args": [
+        "-D",
+        "-f",
+        "projects/sshd/runtime/sshd_config_honeypot",
+        "-p",
+        "2222"
+      ],
+      "use_sudo": true,
+      "module_filters": [
+        "sshd"
+      ],
+      "pre_run_command": "scripts/setup_sshd_honeypot.sh"
+    },
+    {
+      "entry_id": "81b2f2c6-eff4-42df-a127-4b4c4b7f74e2",
+      "name": "sshd @ 2026-01-08 12:02:46 (Sanitized)",
+      "binary_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/sshd/sshd_2026-01-08_12_02_46/sanitized/sshd",
+      "log_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/sshd/instruction_log_sshd_2026-01-08_12_02_46_Sanitized.txt",
+      "timestamp": "2026-01-08T12:33:01.278701",
+      "sanitized_binary_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/sshd/sshd_2026-01-08_12_02_46/sanitized/sshd",
+      "sanitized_outputs": [
+        {
+          "output_id": "6af670fc-8612-4e4e-8780-78b36df8a784",
+          "output_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/sshd/sshd_2026-01-08_12_02_46/sanitized/sshd",
+          "works": null,
+          "segment_gap": 0,
+          "segment_padding": 0,
+          "icf_window": 0,
+          "jumptable_window": 0,
+          "total_instructions": 0,
+          "preserved_instructions": 0,
+          "nopped_instructions": 0,
+          "generated_at": null
+        }
+      ],
+      "parent_entry_id": "26da60dc-9adc-4d36-8d8d-975284caa7c0",
+      "is_sanitized_run": true,
+      "prepared_segments": [],
+      "prepared_at": null,
+      "binary_offset": 0,
+      "trace_address_count": 0,
+      "binary_instruction_count": 0,
+      "sanitized_total_instructions": 0,
+      "sanitized_preserved_instructions": 0,
+      "sanitized_nopped_instructions": 0,
+      "target_args": [
+        "-D",
+        "-f",
+        "projects/sshd/runtime/sshd_config_honeypot",
+        "-p",
+        "2222"
+      ],
+      "use_sudo": true,
+      "module_filters": [
+        "sshd"
+      ],
+      "pre_run_command": "scripts/setup_sshd_honeypot.sh"
+    },
+    {
+      "entry_id": "2edf531b-88d9-4158-b242-9de50dd861af",
+      "name": "sshd @ 2026-01-08 12:02:46 (Sanitized)",
+      "binary_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/sshd/sshd_2026-01-08_12_02_46/sanitized/sshd",
+      "log_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/sshd/instruction_log_sshd_2026-01-08_12_02_46_Sanitized.txt",
+      "timestamp": "2026-01-08T12:33:33.109371",
+      "sanitized_binary_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/sshd/sshd_2026-01-08_12_02_46/sanitized/sshd",
+      "sanitized_outputs": [
+        {
+          "output_id": "68f05932-7392-4a0c-9720-e4fcde314637",
+          "output_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/sshd/sshd_2026-01-08_12_02_46/sanitized/sshd",
+          "works": null,
+          "segment_gap": 0,
+          "segment_padding": 0,
+          "icf_window": 0,
+          "jumptable_window": 0,
+          "total_instructions": 0,
+          "preserved_instructions": 0,
+          "nopped_instructions": 0,
+          "generated_at": null
+        }
+      ],
+      "parent_entry_id": "26da60dc-9adc-4d36-8d8d-975284caa7c0",
+      "is_sanitized_run": true,
+      "prepared_segments": [],
+      "prepared_at": null,
+      "binary_offset": 0,
+      "trace_address_count": 0,
+      "binary_instruction_count": 0,
+      "sanitized_total_instructions": 0,
+      "sanitized_preserved_instructions": 0,
+      "sanitized_nopped_instructions": 0,
+      "target_args": [
+        "-D",
+        "-f",
+        "projects/sshd/runtime/sshd_config_honeypot",
+        "-p",
+        "2222"
+      ],
+      "use_sudo": true,
+      "module_filters": [
+        "sshd"
+      ],
+      "pre_run_command": "scripts/setup_sshd_honeypot.sh"
+    },
+    {
+      "entry_id": "88987228-aa69-414f-81f3-dee71a5d0e76",
+      "name": "sshd @ 2026-01-08 12:40:24",
+      "binary_path": "/usr/sbin/sshd",
+      "log_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/sshd/instruction_log_sshd_2026-01-08_12_40_24.txt",
+      "timestamp": "2026-01-08T12:40:38.528520",
       "sanitized_binary_path": null,
+      "sanitized_outputs": [],
       "parent_entry_id": null,
       "is_sanitized_run": false,
       "prepared_segments": [],
@@ -7812,12 +8494,108 @@
       "sanitized_total_instructions": 0,
       "sanitized_preserved_instructions": 0,
       "sanitized_nopped_instructions": 0,
-      "target_args": null,
+      "target_args": [
+        "-D",
+        "-f",
+        "projects/sshd/runtime/sshd_config_honeypot",
+        "-p",
+        "2222"
+      ],
       "use_sudo": true,
       "module_filters": [
         "sshd"
       ],
-      "pre_run_command": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/scripts/setup_sshd_honeypot.sh"
+      "pre_run_command": "scripts/setup_sshd_honeypot.sh"
+    },
+    {
+      "entry_id": "b96abf43-6daa-41a3-9e5d-37ec5a38ee75",
+      "name": "sshd @ 2026-01-08 12:02:46 (Sanitized)",
+      "binary_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/sshd/sshd_2026-01-08_12_02_46/sanitized/sshd",
+      "log_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/sshd/instruction_log_sshd_2026-01-08_12_02_46_Sanitized.txt",
+      "timestamp": "2026-01-08T12:44:25.627208",
+      "sanitized_binary_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/sshd/sshd_2026-01-08_12_02_46/sanitized/sshd",
+      "sanitized_outputs": [
+        {
+          "output_id": "9aa0995e-899b-4bf5-9e0a-3bc2edd2c67a",
+          "output_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/sshd/sshd_2026-01-08_12_02_46/sanitized/sshd",
+          "works": null,
+          "segment_gap": 0,
+          "segment_padding": 0,
+          "icf_window": 0,
+          "jumptable_window": 0,
+          "total_instructions": 0,
+          "preserved_instructions": 0,
+          "nopped_instructions": 0,
+          "generated_at": null
+        }
+      ],
+      "parent_entry_id": "26da60dc-9adc-4d36-8d8d-975284caa7c0",
+      "is_sanitized_run": true,
+      "prepared_segments": [],
+      "prepared_at": null,
+      "binary_offset": 0,
+      "trace_address_count": 0,
+      "binary_instruction_count": 0,
+      "sanitized_total_instructions": 0,
+      "sanitized_preserved_instructions": 0,
+      "sanitized_nopped_instructions": 0,
+      "target_args": [
+        "-D",
+        "-f",
+        "projects/sshd/runtime/sshd_config_honeypot",
+        "-p",
+        "2222"
+      ],
+      "use_sudo": true,
+      "module_filters": [
+        "sshd"
+      ],
+      "pre_run_command": "scripts/setup_sshd_honeypot.sh"
+    },
+    {
+      "entry_id": "d77fe4f1-e1ab-459d-9b07-b5255eec282f",
+      "name": "sshd @ 2026-01-08 12:02:46 (Sanitized)",
+      "binary_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/sshd/sshd_2026-01-08_12_02_46/sanitized/sshd",
+      "log_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/sshd/instruction_log_sshd_2026-01-08_12_02_46_Sanitized.txt",
+      "timestamp": "2026-01-08T12:47:02.819536",
+      "sanitized_binary_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/sshd/sshd_2026-01-08_12_02_46/sanitized/sshd",
+      "sanitized_outputs": [
+        {
+          "output_id": "88e4a724-2e9e-470f-a6e1-8378b13b01d9",
+          "output_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/sshd/sshd_2026-01-08_12_02_46/sanitized/sshd",
+          "works": null,
+          "segment_gap": 0,
+          "segment_padding": 0,
+          "icf_window": 0,
+          "jumptable_window": 0,
+          "total_instructions": 0,
+          "preserved_instructions": 0,
+          "nopped_instructions": 0,
+          "generated_at": null
+        }
+      ],
+      "parent_entry_id": "26da60dc-9adc-4d36-8d8d-975284caa7c0",
+      "is_sanitized_run": true,
+      "prepared_segments": [],
+      "prepared_at": null,
+      "binary_offset": 0,
+      "trace_address_count": 0,
+      "binary_instruction_count": 0,
+      "sanitized_total_instructions": 0,
+      "sanitized_preserved_instructions": 0,
+      "sanitized_nopped_instructions": 0,
+      "target_args": [
+        "-D",
+        "-f",
+        "projects/sshd/runtime/sshd_config_honeypot",
+        "-p",
+        "2222"
+      ],
+      "use_sudo": true,
+      "module_filters": [
+        "sshd"
+      ],
+      "pre_run_command": "scripts/setup_sshd_honeypot.sh"
     }
   ],
   "Default Project": []

@@ -16,7 +16,6 @@ from services.pin_runner import PIN_ROOT_DEFAULT, PinRunner
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run a target binary with Intel PIN")
-    parser.add_argument("target", help="Path to the binary you want to instrument")
     parser.add_argument(
         "--pin-root",
         default=str(PIN_ROOT_DEFAULT),
@@ -38,25 +37,36 @@ def build_parser() -> argparse.ArgumentParser:
         help="Only record the first execution of each instruction address",
     )
     parser.add_argument(
-        "target_args",
-        nargs=argparse.REMAINDER,
-        help="Arguments passed verbatim to the target (use -- to stop parsing)",
+        "--timeout",
+        type=float,
+        default=None,
+        help="Maximum runtime in seconds before the run is terminated (optional)",
     )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args, rest = parser.parse_known_args(argv)
+
+    if not rest:
+        parser.error("Missing target binary path")
+
+    target = rest[0]
+    extra_args = list(rest[1:])
+    # Common convention: allow `--` to separate script options from target args.
+    if extra_args and extra_args[0] == "--":
+        extra_args = extra_args[1:]
 
     pin_bin = Path(args.pin_root) / "pin"
     runner = PinRunner(pin_bin=pin_bin, tool_path=args.tool, default_log=args.log)
 
     try:
         log_file = runner.run(
-            args.target,
-            extra_target_args=args.target_args,
+            target,
+            extra_target_args=extra_args,
             unique_only=args.unique_only,
+            timeout=args.timeout,
         )
     except Exception as exc:  # pragma: no cover - CLI feedback path
         parser.error(str(exc))

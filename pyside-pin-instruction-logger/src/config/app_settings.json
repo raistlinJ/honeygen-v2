@@ -21,6 +21,7 @@
       "tool_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/pin-tool/obj-intel64/ins_logger.so",
       "revng_docker_image": "revng/revng",
       "default_pre_run_command": "",
+      "default_target_args": "",
       "sanitize_runnable_first": true,
       "sanitize_only_text": false,
       "sanitize_preserve_trampolines": true,
@@ -28,6 +29,7 @@
       "sanitize_protect_unwind": true,
       "sanitize_protect_indirect": true,
       "sanitize_segment_padding": "0x2000",
+      "sanitize_segment_gap": "0x200000",
       "sanitize_icf_window": "0x400",
       "sanitize_jumptable_window": "0x800"
     },
@@ -38,6 +40,7 @@
       "tool_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/pin-tool/obj-intel64/ins_logger.so",
       "revng_docker_image": "revng/revng",
       "default_pre_run_command": "",
+      "default_target_args": "",
       "sanitize_runnable_first": true,
       "sanitize_only_text": false,
       "sanitize_preserve_trampolines": true,
@@ -45,6 +48,7 @@
       "sanitize_protect_unwind": true,
       "sanitize_protect_indirect": true,
       "sanitize_segment_padding": "0x2000",
+      "sanitize_segment_gap": "0x200000",
       "sanitize_icf_window": "0x400",
       "sanitize_jumptable_window": "0x800"
     },
@@ -55,6 +59,7 @@
       "tool_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/pin-tool/obj-intel64/ins_logger.so",
       "revng_docker_image": "revng/revng",
       "default_pre_run_command": "",
+      "default_target_args": "",
       "sanitize_runnable_first": true,
       "sanitize_only_text": false,
       "sanitize_preserve_trampolines": true,
@@ -62,6 +67,7 @@
       "sanitize_protect_unwind": true,
       "sanitize_protect_indirect": true,
       "sanitize_segment_padding": "0x2000",
+      "sanitize_segment_gap": "0x200000",
       "sanitize_icf_window": "0x400",
       "sanitize_jumptable_window": "0x800"
     },
@@ -72,6 +78,7 @@
       "tool_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/pin-tool/obj-intel64/ins_logger.so",
       "revng_docker_image": "revng/revng",
       "default_pre_run_command": "",
+      "default_target_args": "",
       "sanitize_runnable_first": true,
       "sanitize_only_text": false,
       "sanitize_preserve_trampolines": true,
@@ -79,6 +86,7 @@
       "sanitize_protect_unwind": true,
       "sanitize_protect_indirect": true,
       "sanitize_segment_padding": "0x2000",
+      "sanitize_segment_gap": "0x200000",
       "sanitize_icf_window": "0x400",
       "sanitize_jumptable_window": "0x800"
     },
@@ -89,6 +97,7 @@
       "tool_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/pin-tool/obj-intel64/ins_logger.so",
       "revng_docker_image": "revng/revng",
       "default_pre_run_command": "",
+      "default_target_args": "",
       "sanitize_runnable_first": true,
       "sanitize_only_text": false,
       "sanitize_preserve_trampolines": true,
@@ -96,6 +105,7 @@
       "sanitize_protect_unwind": true,
       "sanitize_protect_indirect": true,
       "sanitize_segment_padding": "0x2000",
+      "sanitize_segment_gap": "0x200000",
       "sanitize_icf_window": "0x400",
       "sanitize_jumptable_window": "0x800"
     },
@@ -105,16 +115,18 @@
       "binary_path": "/usr/sbin/sshd",
       "tool_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/pin-tool/obj-intel64/ins_logger.so",
       "revng_docker_image": "revng/revng",
-      "default_pre_run_command": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/scripts/setup_sshd_honeypot.sh",
+      "default_pre_run_command": "scripts/setup_sshd_honeypot.sh",
+      "default_target_args": "-D -f projects/sshd/runtime/sshd_config_honeypot -p 2222",
       "sanitize_runnable_first": true,
-      "sanitize_only_text": false,
+      "sanitize_only_text": true,
       "sanitize_preserve_trampolines": true,
       "sanitize_protect_dynlinks": true,
       "sanitize_protect_unwind": true,
       "sanitize_protect_indirect": true,
-      "sanitize_segment_padding": "0x2000",
-      "sanitize_icf_window": "0x400",
-      "sanitize_jumptable_window": "0x800"
+      "sanitize_segment_padding": "0x0",
+      "sanitize_segment_gap": "0x7000",
+      "sanitize_icf_window": "0x0",
+      "sanitize_jumptable_window": "0x0"
     }
   }
 }

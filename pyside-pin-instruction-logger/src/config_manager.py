@@ -22,6 +22,8 @@ class ProjectConfig:
     revng_docker_image: str = "revng/revng"
     # Default pre-run command/script to execute before target launch
     default_pre_run_command: str = ""
+    # Default command-line arguments for the target binary
+    default_target_args: str = ""
 
     # Sanitization preferences (GUI defaults). Keep conservative values by default.
     sanitize_runnable_first: bool = True
@@ -31,6 +33,7 @@ class ProjectConfig:
     sanitize_protect_unwind: bool = True
     sanitize_protect_indirect: bool = True
     sanitize_segment_padding: str = "0x2000"
+    sanitize_segment_gap: str = "0x200000"
     sanitize_icf_window: str = "0x400"
     sanitize_jumptable_window: str = "0x800"
 
@@ -107,6 +110,7 @@ class ConfigManager:
             tool_path=fallback.tool_path,
             revng_docker_image=fallback.revng_docker_image,
             default_pre_run_command="",
+            default_target_args="",
         )
         if isinstance(raw, dict):
             for key, value in raw.items():

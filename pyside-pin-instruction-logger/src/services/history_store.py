@@ -7,6 +7,7 @@ from typing import Any
 from uuid import uuid4
 
 from models.run_entry import RunEntry
+from models.sanitized_output import SanitizedBinaryOutput
 
 HISTORY_PATH = Path(__file__).resolve().parents[1] / "config" / "honey_history.json"
 
@@ -16,6 +17,24 @@ def _as_int(value: Any) -> int:
         return int(value)
     except (TypeError, ValueError):
         return 0
+
+
+def _as_optional_bool(value: Any) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"", "none", "null", "unknown", "-", "—"}:
+            return None
+        if lowered in {"true", "yes", "y", "1", "works", "ok", "pass"}:
+            return True
+        if lowered in {"false", "no", "n", "0", "broken", "fail"}:
+            return False
+    return None
 
 
 class HistoryStore:
@@ -50,6 +69,51 @@ class HistoryStore:
             sanitized_total = _as_int(raw.get("sanitized_total_instructions", 0))
             sanitized_preserved = _as_int(raw.get("sanitized_preserved_instructions", 0))
             sanitized_nopped = _as_int(raw.get("sanitized_nopped_instructions", 0))
+
+            sanitized_outputs: list[SanitizedBinaryOutput] = []
+            for output in (raw.get("sanitized_outputs") or []):
+                if not isinstance(output, dict):
+                    continue
+                generated_at = None
+                generated_at_raw = output.get("generated_at")
+                if generated_at_raw:
+                    try:
+                        generated_at = datetime.fromisoformat(str(generated_at_raw))
+                    except ValueError:
+                        generated_at = None
+                sanitized_outputs.append(
+                    SanitizedBinaryOutput(
+                        output_id=str(output.get("output_id") or uuid4()),
+                        output_path=str(output.get("output_path") or ""),
+                        works=_as_optional_bool(output.get("works")),
+                        segment_gap=_as_int(output.get("segment_gap", 0)),
+                        segment_padding=_as_int(output.get("segment_padding", 0)),
+                        icf_window=_as_int(output.get("icf_window", 0)),
+                        jumptable_window=_as_int(output.get("jumptable_window", 0)),
+                        total_instructions=_as_int(output.get("total_instructions", 0)),
+                        preserved_instructions=_as_int(output.get("preserved_instructions", 0)),
+                        nopped_instructions=_as_int(output.get("nopped_instructions", 0)),
+                        generated_at=generated_at,
+                    )
+                )
+
+            legacy_sanitized_path = raw.get("sanitized_binary_path")
+            if legacy_sanitized_path and not sanitized_outputs:
+                sanitized_outputs.append(
+                    SanitizedBinaryOutput(
+                        output_id=str(uuid4()),
+                        output_path=str(legacy_sanitized_path),
+                        works=None,
+                        segment_gap=0,
+                        segment_padding=0,
+                        icf_window=0,
+                        jumptable_window=0,
+                        total_instructions=sanitized_total,
+                        preserved_instructions=sanitized_preserved,
+                        nopped_instructions=sanitized_nopped,
+                        generated_at=None,
+                    )
+                )
             entries.append(
                 RunEntry(
                     entry_id=raw.get("entry_id") or str(uuid4()),
@@ -58,6 +122,7 @@ class HistoryStore:
                     log_path=raw.get("log_path", ""),
                     timestamp=timestamp,
                     sanitized_binary_path=raw.get("sanitized_binary_path"),
+                    sanitized_outputs=sanitized_outputs,
                     parent_entry_id=raw.get("parent_entry_id"),
                     is_sanitized_run=raw.get("is_sanitized_run", False),
                     prepared_segments=prepared_segments or None,
@@ -120,6 +185,23 @@ class HistoryStore:
             "log_path": entry.log_path,
             "timestamp": entry.timestamp.isoformat(),
             "sanitized_binary_path": entry.sanitized_binary_path,
+            "sanitized_outputs": [
+                {
+                    "output_id": output.output_id,
+                    "output_path": output.output_path,
+                    "works": getattr(output, "works", None),
+                    "segment_gap": int(output.segment_gap or 0),
+                    "segment_padding": int(output.segment_padding or 0),
+                    "icf_window": int(getattr(output, "icf_window", 0) or 0),
+                    "jumptable_window": int(getattr(output, "jumptable_window", 0) or 0),
+                    "total_instructions": int(output.total_instructions or 0),
+                    "preserved_instructions": int(output.preserved_instructions or 0),
+                    "nopped_instructions": int(output.nopped_instructions or 0),
+                    "generated_at": output.generated_at.isoformat() if output.generated_at else None,
+                }
+                for output in (getattr(entry, "sanitized_outputs", None) or [])
+                if getattr(output, "output_path", None)
+            ],
             "parent_entry_id": entry.parent_entry_id,
             "is_sanitized_run": entry.is_sanitized_run,
             "prepared_segments": self._format_segments(entry.prepared_segments),
