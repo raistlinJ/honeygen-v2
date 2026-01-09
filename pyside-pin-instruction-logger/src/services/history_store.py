@@ -137,6 +137,7 @@ class HistoryStore:
                     use_sudo=bool(raw.get("use_sudo", False)),
                     module_filters=raw.get("module_filters") or None,
                     pre_run_command=raw.get("pre_run_command") or None,
+                    run_metrics=raw.get("run_metrics") if isinstance(raw.get("run_metrics"), dict) else None,
                 )
             )
         return entries
@@ -216,6 +217,7 @@ class HistoryStore:
             "use_sudo": bool(getattr(entry, "use_sudo", False)),
             "module_filters": list(entry.module_filters) if entry.module_filters else None,
             "pre_run_command": entry.pre_run_command or None,
+            "run_metrics": getattr(entry, "run_metrics", None) if isinstance(getattr(entry, "run_metrics", None), dict) else None,
         }
 
     def _read_all(self) -> dict[str, list[dict[str, Any]]]:

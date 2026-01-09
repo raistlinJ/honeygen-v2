@@ -88,7 +88,20 @@ pyside-pin-instruction-logger
    uv run python scripts/run_with_pin.py ./path/to/binary -- --arg1 --arg2
    ```
 - By default both the GUI and CLI call `/home/researchdev/Downloads/pin4/pin`. Override by setting `PIN_ROOT=/custom/pin` before running.
+- If you click **Stop** during a sanitized run, the app terminates the active PIN process group and then best-effort cleans up any lingering daemonized processes started from the sanitized executable. If the run used `sudo`, you may be prompted for your sudo password so it can stop root-owned lingering processes.
 - When preparing a log that will later drive sanitization, make sure lazy-binding stubs (PLT entries) actually execute. The quickest way is to set `LD_BIND_NOW=1` for that run (in the GUI, add it under “Environment Overrides”; via CLI run `LD_BIND_NOW=1 uv run python scripts/run_with_pin.py …`). This forces glibc to resolve every PLT slot up front so the trace covers those addresses and the sanitizer leaves them intact. If you can’t rerun with that flag, leave the **Preserve PLT/.init/.fini sections** toggle (enabled by default) turned on so the sanitizer skips those trampolines for you.
+
+## Why The Sanitization Knobs Exist
+
+Sanitization is trace-driven: it preserves instructions seen executing in a run log and replaces others with NOPs. Crashes happen when a later run depends on bytes that the trace did not justify preserving.
+
+Main reasons:
+- **Coverage gaps:** different args/env/timing trigger code paths you never executed in the traced run.
+- **Executable bytes that are read as data/metadata:** jump tables and runtime metadata can live near/inside executable sections and be required even if never executed.
+- **Indirect control flow:** function pointers/switch dispatch often need conservative “neighborhood” preservation around traced regions.
+- **Runtime variability:** ASLR/PIE, lazy binding, threads/signals, and syscall failures can change required paths between runs.
+
+Multiple traces help by increasing executed-address coverage, but they do not eliminate the need for conservative preservation knobs (segment gap/padding, dynlink/unwind protection) when your goal is “runs reliably.”
 
 ## Contributing
 

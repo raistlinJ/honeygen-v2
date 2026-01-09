@@ -138,3 +138,54 @@ def test_batch_prints_summary_on_completion(qtbot, tmp_path, monkeypatch):
     assert "- OK: /tmp/a -> /tmp/a.log" in combined
     assert "- FAILED: /tmp/b" in combined
     assert dummy.finished is True
+
+
+@pytest.mark.qt_no_exception_capture
+def test_assume_works_does_not_auto_terminate_single_run(qtbot, tmp_path, monkeypatch):
+    import time as _time
+
+    app = _make_isolated_app(qtbot, tmp_path, monkeypatch)
+
+    # Force allow running without interactive prompts.
+    monkeypatch.setattr(app, "_ensure_aslr_disabled_for_execution", lambda *a, **k: True)
+
+    terminate_called = {"value": False}
+
+    def _fake_terminate(*args, **kwargs):
+        terminate_called["value"] = True
+
+    monkeypatch.setattr(app, "_request_terminate_current_run", _fake_terminate)
+    monkeypatch.setattr(app.controller, "stop_logging", lambda: None)
+
+    def _fake_run_binary(*args, **kwargs):
+        on_output = kwargs.get("on_output")
+        if callable(on_output):
+            on_output("started")
+        # Sleep long enough for the assume-works timer to fire.
+        _time.sleep(0.15)
+        return tmp_path / "log.txt"
+
+    monkeypatch.setattr(app.controller, "run_binary", _fake_run_binary)
+
+    dialog = app_module.RunProgressDialog(app, "single-assume-works", on_stop=None)
+    qtbot.addWidget(dialog)
+
+    started = app._run_with_progress(
+        "/bin/true",
+        str(tmp_path / "log.txt"),
+        record_entry=False,
+        dialog_label="single-assume-works",
+        is_sanitized_run=True,
+        assume_works_entry_id="missing",
+        assume_works_output_id="missing",
+        assume_works_after_ms=50,
+        run_with_sudo=False,
+        block=False,
+        dialog=dialog,
+        suppress_failure_dialog=True,
+        batch_mode=False,
+    )
+    assert started is True
+
+    qtbot.waitUntil(lambda: app._current_run_thread is None, timeout=5000)
+    assert terminate_called["value"] is False

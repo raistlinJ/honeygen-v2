@@ -49,6 +49,9 @@ class RunnerController:
         sudo_password: str | None = None,
         on_output: Callable[[str], None] | None = None,
         extra_target_args: Sequence[str] | None = None,
+        collect_cpu_metrics: bool = False,
+        collect_memory_metrics: bool = False,
+        collect_timing_metrics: bool = False,
     ) -> Path:
         return self.pin_runner.run(
             binary_path,
@@ -59,6 +62,9 @@ class RunnerController:
             use_sudo=use_sudo,
             sudo_password=sudo_password,
             on_output=on_output,
+            collect_cpu_metrics=bool(collect_cpu_metrics),
+            collect_memory_metrics=bool(collect_memory_metrics),
+            collect_timing_metrics=bool(collect_timing_metrics),
         )
 
     def stop_logging(self) -> None:

@@ -15,7 +15,8 @@ license = { text = "MIT" }
 dependencies = [
     "PySide6==6.6.3",
     "numpy>=1.26",
-    "pandas>=2.2"
+    "pandas>=2.2",
+    "psutil>=5.9.0"
 ]
 
 [project.urls]

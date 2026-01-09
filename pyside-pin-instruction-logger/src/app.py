@@ -103,6 +103,7 @@ SEGMENT_TABLE_BATCH_INTERVAL_MS = 5
 RUN_BATCH_OUTPUT_FLUSH_INTERVAL_MS = 75
 RUN_BATCH_OUTPUT_MAX_LINES_PER_FLUSH = 200
 RUN_BATCH_OUTPUT_MAX_BUFFERED_LINES = 4000
+SANITIZED_BATCH_INTER_RUN_DELAY_MS_DEFAULT = 2000
 
 
 _WHITESPACE_RE = re.compile(r"\s+")
@@ -238,6 +239,9 @@ class RunWorker(QObject):
         sudo_password: str | None = None,
         extra_target_args: list[str] | None = None,
         pre_run_command: str | None = None,
+        collect_cpu_metrics: bool = False,
+        collect_memory_metrics: bool = False,
+        collect_timing_metrics: bool = False,
     ) -> None:
         super().__init__()
         self.controller = controller
@@ -249,6 +253,42 @@ class RunWorker(QObject):
         self.sudo_password = sudo_password
         self.extra_target_args = list(extra_target_args) if extra_target_args else None
         self.pre_run_command = pre_run_command or None
+        self.collect_cpu_metrics = bool(collect_cpu_metrics)
+        self.collect_memory_metrics = bool(collect_memory_metrics)
+        self.collect_timing_metrics = bool(collect_timing_metrics)
+        self.metrics: dict[str, object] | None = None
+        self._active_prerun_process = None
+        self._active_prerun_pgid: int | None = None
+
+    def request_stop(self) -> None:
+        """Best-effort termination for the current run.
+
+        Stops any in-flight pre-run subprocess (if present) and then asks the controller
+        to stop the active PIN logging session.
+        """
+        proc = getattr(self, "_active_prerun_process", None)
+        if proc is not None:
+            try:
+                if getattr(proc, "poll", lambda: None)() is None:
+                    import os as _os
+                    import signal as _signal
+
+                    pgid = getattr(self, "_active_prerun_pgid", None)
+                    if pgid is not None:
+                        try:
+                            _os.killpg(int(pgid), _signal.SIGTERM)
+                        except Exception:
+                            pass
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        # Stop the main PIN run (if any). This can block due to wait/kill escalation;
+        # callers should run this off the GUI thread.
+        self.controller.stop_logging()
 
     def run(self) -> None:  # pragma: no cover - runs in worker thread
         try:
@@ -276,7 +316,13 @@ class RunWorker(QObject):
                     text=True,
                     bufsize=1,
                     cwd=_os.getcwd(),
+                    preexec_fn=getattr(_os, "setsid", None),
                 )
+                self._active_prerun_process = proc
+                try:
+                    self._active_prerun_pgid = _os.getpgid(int(proc.pid))
+                except Exception:
+                    self._active_prerun_pgid = None
                 if self.use_sudo and self.sudo_password and proc.stdin is not None:
                     try:
                         proc.stdin.write(self.sudo_password + "\n")
@@ -294,6 +340,8 @@ class RunWorker(QObject):
                     if clean:
                         self.output.emit(clean)
                 proc.wait()
+                self._active_prerun_process = None
+                self._active_prerun_pgid = None
                 if proc.returncode != 0:
                     raise RuntimeError("Pre-run command failed with non-zero exit status")
             result = self.controller.run_binary(
@@ -305,10 +353,44 @@ class RunWorker(QObject):
                 sudo_password=self.sudo_password,
                 on_output=self.output.emit,
                 extra_target_args=self.extra_target_args,
+                collect_cpu_metrics=self.collect_cpu_metrics,
+                collect_memory_metrics=self.collect_memory_metrics,
+                collect_timing_metrics=self.collect_timing_metrics,
             )
+            self.metrics = getattr(getattr(self.controller, "pin_runner", None), "last_metrics", None)
             self.succeeded.emit(str(result))
         except Exception as exc:
+            self._active_prerun_process = None
+            self._active_prerun_pgid = None
+            self.metrics = getattr(getattr(self.controller, "pin_runner", None), "last_metrics", None)
             self.failed.emit(str(exc))
+
+
+def _format_run_metrics(metrics: dict[str, object]) -> str:
+    parts: list[str] = []
+    try:
+        wall = metrics.get("wall_time_ms")
+        if wall is not None:
+            parts.append(f"wall={int(wall)}ms")
+    except Exception:
+        pass
+    try:
+        user_s = metrics.get("cpu_user_s")
+        system_s = metrics.get("cpu_system_s")
+        if user_s is not None or system_s is not None:
+            user_val = float(user_s or 0.0)
+            sys_val = float(system_s or 0.0)
+            parts.append(f"cpu={user_val:.3f}s user + {sys_val:.3f}s sys")
+    except Exception:
+        pass
+    try:
+        peak = metrics.get("peak_rss_bytes")
+        if peak is not None:
+            peak_int = int(peak)
+            parts.append(f"peak_rss={peak_int / (1024 * 1024):.1f} MiB")
+    except Exception:
+        pass
+    return ", ".join(parts) if parts else "(no metrics)"
 
 
 class RunProgressDialog(QDialog):
@@ -535,6 +617,8 @@ class ModuleSelectionDialog(QDialog):
 
         self._populate_list()
         self._restore_previous_selection()
+        if self._is_sanitized_run:
+            self._force_enable_sanitized_binary_module(binary_label)
         self._handle_log_label_changed(self.log_label_input.text())
 
         if self._is_sanitized_run:
@@ -549,6 +633,29 @@ class ModuleSelectionDialog(QDialog):
             self.add_button.setEnabled(False)
 
         self.resize(760, 560)
+
+    def _force_enable_sanitized_binary_module(self, binary_label: str) -> None:
+        """Ensure the main sanitized binary module is selected.
+
+        When module filters are provided, the PIN tool will only trace modules that match.
+        For sanitized replays, we force the main executable's module (basename match) to be
+        included to avoid accidentally tracing only shared libraries.
+        """
+        try:
+            target = (binary_label or "").strip()
+            if not target:
+                return
+            # Module filters treat basenames as exact matches.
+            want = target.lower()
+            for row in range(self.module_list.count()):
+                item = self.module_list.item(row)
+                if item is None:
+                    continue
+                if item.text().strip().lower() == want:
+                    item.setCheckState(Qt.Checked)
+                    break
+        except Exception:
+            return
 
     def _populate_list(self) -> None:
         seen: set[str] = set()
@@ -1642,6 +1749,7 @@ class SanitizeWorker(QObject):
     progress = Signal(str)
     succeeded = Signal(SanitizationResult)
     failed = Signal(str)
+    cancelled = Signal(str)
 
     def __init__(
         self,
@@ -1670,6 +1778,20 @@ class SanitizeWorker(QObject):
         self.binary_offset = int(binary_offset or 0)
         self._preserve_segments = self._normalize_segments(preserve_segments)
         self._segment_padding = max(0, int(segment_padding or 0))
+        self._cancel_requested = False
+
+    def cancel(self) -> None:
+        self._cancel_requested = True
+
+    def _should_cancel(self, extra: Callable[[], bool] | None = None) -> bool:
+        if self._cancel_requested:
+            return True
+        if extra is not None:
+            try:
+                return bool(extra())
+            except Exception:
+                return False
+        return False
 
     @staticmethod
     def _apply_binary_offset_to_addresses(
@@ -1836,7 +1958,11 @@ class SanitizeWorker(QObject):
         log_path.write_text("\n".join(lines), encoding="utf-8")
         return log_path
 
-    def _sanitize(self) -> SanitizationResult:
+    def _sanitize(self, *, should_cancel: Callable[[], bool] | None = None) -> SanitizationResult:
+        if self._should_cancel(should_cancel):
+            from services.binary_sanitizer import SanitizationCancelled
+
+            raise SanitizationCancelled("Sanitization cancelled.")
         executed = set(self.executed_addresses)
         samples = list(self.instruction_samples)
         offset = self.binary_offset
@@ -1930,6 +2056,10 @@ class SanitizeWorker(QObject):
                 self.progress.emit(f"Added {len(icf)} heuristic indirect-control-flow protected range(s).")
 
         if self.options.sanity_check and samples:
+            if self._should_cancel(should_cancel):
+                from services.binary_sanitizer import SanitizationCancelled
+
+                raise SanitizationCancelled("Sanitization cancelled.")
             self.progress.emit("Validating logged instructions against binary...")
             if binary_obj is None:
                 binary_obj = lief.parse(str(self.binary_path))
@@ -1969,18 +2099,27 @@ class SanitizeWorker(QObject):
             binary=binary_obj,
             preserve_trampolines=self.options.preserve_trampoline_sections,
             protected_ranges=protected_ranges,
+            should_cancel=lambda: self._should_cancel(should_cancel),
         )
         self.progress.emit(f"Wrote sanitized binary to {result.output_path}.")
         if self.options.sanity_check:
+            if self._should_cancel(should_cancel):
+                from services.binary_sanitizer import SanitizationCancelled
+
+                raise SanitizationCancelled("Sanitization cancelled.")
             self.progress.emit("Running sanity check on sanitized binary...")
             sanitizer.sanity_check(result.output_path)
             self.progress.emit("Sanity check passed.")
         return result
 
     def run(self) -> None:
+        from services.binary_sanitizer import SanitizationCancelled
+
         try:
             result = self._sanitize()
             self.succeeded.emit(result)
+        except SanitizationCancelled as exc:
+            self.cancelled.emit(str(exc) or "Sanitization cancelled.")
         except Exception as exc:  # pragma: no cover - GUI background task
             self.failed.emit(f"Sanitization failed for log '{self.log_path}': {exc}")
 
@@ -1990,6 +2129,7 @@ class SanitizeSweepWorker(QObject):
     progress_counts = Signal(int, int)
     variant_succeeded = Signal(object)
     finished = Signal(object)
+    cancelled = Signal(object)
 
     def __init__(
         self,
@@ -2018,6 +2158,10 @@ class SanitizeSweepWorker(QObject):
         self.binary_offset = int(binary_offset or 0)
         self.preserve_segments = list(preserve_segments or [])
         self.sweep_variants = list(sweep_variants)
+        self._cancel_requested = False
+
+    def cancel(self) -> None:
+        self._cancel_requested = True
 
     def run(self) -> None:  # pragma: no cover - worker thread
         total = len(self.sweep_variants)
@@ -2025,6 +2169,12 @@ class SanitizeSweepWorker(QObject):
         failures = 0
         self.progress_counts.emit(0, total)
         for idx, (gap, padding, icf_window, jumptable_window) in enumerate(self.sweep_variants, start=1):
+            if self._cancel_requested:
+                self.progress.emit(f"Sweep cancelled after {idx - 1}/{total} variant(s).")
+                summary = {"successes": successes, "failures": failures, "total": total, "cancelled": True}
+                self.cancelled.emit(summary)
+                self.finished.emit(summary)
+                return
             try:
                 self.progress_counts.emit(idx, total)
                 suffix = self.output_template.suffix
@@ -2061,7 +2211,7 @@ class SanitizeSweepWorker(QObject):
                 self.progress.emit(
                     f"Sweep {idx}/{total}: gap=0x{gap:x} pad=0x{padding:x} icf=0x{icf_window:x} jt=0x{jumptable_window:x}"
                 )
-                result = worker._sanitize()
+                result = worker._sanitize(should_cancel=lambda: self._cancel_requested)
                 successes += 1
                 self.variant_succeeded.emit(
                     {
@@ -2100,6 +2250,7 @@ class SanitizeOptions(NamedTuple):
     icf_window: int
     jumptable_window: int
     segment_gap: int
+    keep_only_one_per_nop_count: bool
 
 
 class RunSanitizedOptions(NamedTuple):
@@ -2158,6 +2309,8 @@ class BuildProgressDialog(QDialog):
 
 
 class SanitizeProgressDialog(QDialog):
+    stop_requested = Signal()
+
     def __init__(self, parent: QWidget, binary_label: str) -> None:
         super().__init__(parent)
         self.setWindowTitle("Generating Sanitized Binary")
@@ -2170,10 +2323,13 @@ class SanitizeProgressDialog(QDialog):
         self.progress_bar = QProgressBar(self)
         self.progress_bar.setRange(0, 0)
         self.buttons = QDialogButtonBox(QDialogButtonBox.Close, self)
+        self.stop_button = QPushButton("Stop", self)
+        self.buttons.addButton(self.stop_button, QDialogButtonBox.ActionRole)
         self.close_button = self.buttons.button(QDialogButtonBox.Close)
         if self.close_button:
             self.close_button.setEnabled(False)
         self.buttons.rejected.connect(self.reject)
+        self.stop_button.clicked.connect(self._handle_stop_clicked)
 
         layout.addWidget(self.status_label)
         layout.addWidget(self.output_view)
@@ -2204,8 +2360,15 @@ class SanitizeProgressDialog(QDialog):
         self.status_label.setText(message)
         self.progress_bar.setRange(0, 1)
         self.progress_bar.setValue(1)
+        self.stop_button.setEnabled(False)
         if self.close_button:
             self.close_button.setEnabled(True)
+
+    def _handle_stop_clicked(self) -> None:
+        self.stop_button.setEnabled(False)
+        self.append_output("Stop requested. Attempting to cancel...")
+        self.update_status("Stopping...")
+        self.stop_requested.emit()
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         if not self._finished:
@@ -2268,14 +2431,23 @@ class SanitizeConfigDialog(QDialog):
 
         self.protect_dynlinks_checkbox = QCheckBox("Protect dynamic-linking sections (.got/.dynamic/.rela.*)", advanced_group)
         self.protect_dynlinks_checkbox.setChecked(True)
+        self.protect_dynlinks_checkbox.setToolTip(
+            "Keep dynamic-linker plumbing needed at runtime (GOT/relocations), even if your trace didn't execute those bytes."
+        )
         advanced_layout.addWidget(self.protect_dynlinks_checkbox)
 
         self.protect_unwind_checkbox = QCheckBox("Protect unwind/exception metadata (.eh_frame*)", advanced_group)
         self.protect_unwind_checkbox.setChecked(True)
+        self.protect_unwind_checkbox.setToolTip(
+            "Keep unwind/exception metadata used for stack unwinding; missing this can crash even when the traced code path looks complete."
+        )
         advanced_layout.addWidget(self.protect_unwind_checkbox)
 
         self.protect_indirect_checkbox = QCheckBox("Protect indirect control-flow neighborhoods", advanced_group)
         self.protect_indirect_checkbox.setChecked(True)
+        self.protect_indirect_checkbox.setToolTip(
+            "Preserve bytes around indirect branches (jump tables/ICF). Indirect dispatch can read nearby data in executable sections."
+        )
         advanced_layout.addWidget(self.protect_indirect_checkbox)
 
         knobs_group = QGroupBox("Advanced knobs", self)
@@ -2283,45 +2455,223 @@ class SanitizeConfigDialog(QDialog):
         knobs_layout.setContentsMargins(12, 12, 12, 12)
         knobs_layout.setSpacing(6)
 
-        def _range_row(label: str, default_value: int) -> tuple[QHBoxLayout, QLineEdit, QLineEdit]:
+        initial_values: dict[str, object] = initial if isinstance(initial, dict) else {}
+
+        def _init_text(key: str, fallback: str) -> str:
+            value = initial_values.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+            return fallback
+
+        def _init_list(key: str) -> list[str]:
+            value = initial_values.get(key)
+            if isinstance(value, list):
+                return [str(v) for v in value if str(v).strip()]
+            return []
+
+        def _unique_history(values: list[str], *, limit: int = 20) -> list[str]:
+            seen: set[str] = set()
+            out: list[str] = []
+            for raw in values:
+                value = (raw or "").strip()
+                if not value:
+                    continue
+                key = value.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(value)
+                if len(out) >= limit:
+                    break
+            return out
+
+        def _history_combo(
+            default_text: str,
+            history: list[str] | None,
+            *,
+            max_width: int,
+            presets: list[str],
+        ) -> QComboBox:
+            combo = QComboBox(knobs_group)
+            combo.setEditable(True)
+            combo.setInsertPolicy(QComboBox.InsertPolicy.InsertAtTop)
+
+            # Keep exactly 10 built-in options visible even in a fresh project.
+            # Ensure the current default value is represented within those 10.
+            preset_items = _unique_history(list(presets), limit=10)
+            default_clean = (default_text or "").strip()
+            if default_clean:
+                if not any(item.lower() == default_clean.lower() for item in preset_items):
+                    if preset_items:
+                        preset_items[0] = default_clean
+                    else:
+                        preset_items = [default_clean]
+
+            items = _unique_history(preset_items + list(history or []), limit=200)
+            combo.addItems(items)
+            combo.setCurrentText((default_text or "").strip())
+            combo.setMaximumWidth(int(max_width))
+            return combo
+
+        # Single header for the Start/End/Interval columns.
+        header_row = QHBoxLayout()
+        header_row.addWidget(QLabel("", knobs_group))
+        header_row.addStretch(1)
+        header_row.addWidget(QLabel("Start", knobs_group))
+        header_row.addSpacing(120)
+        header_row.addWidget(QLabel("End", knobs_group))
+        header_row.addSpacing(128)
+        header_row.addWidget(QLabel("Interval", knobs_group))
+        header_row.addStretch(1)
+        knobs_layout.addLayout(header_row)
+
+        def _range_row(
+            label: str,
+            *,
+            default_start: str,
+            default_end: str,
+            default_interval: str,
+            value_history: list[str] | None,
+            interval_history: list[str] | None,
+            value_presets: list[str],
+            interval_presets: list[str],
+        ) -> tuple[QHBoxLayout, QComboBox, QComboBox, QComboBox]:
             row = QHBoxLayout()
-            row.addWidget(QLabel(label, knobs_group))
-            range_input = QLineEdit(f"0x{default_value:x}-0x{default_value:x}", knobs_group)
-            range_input.setToolTip(
-                "Range in the form start-end (supports hex like 0x2000-0x4000). Use a single value for a fixed knob."
+            row_label = QLabel(label, knobs_group)
+            row_label.setToolTip(
+                "Try a range of values (Start→End by Interval) to balance size vs runnability; indirect control flow/metadata often need conservative values."
             )
-            range_input.setMaximumWidth(270)
-            interval_input = QLineEdit("0x0", knobs_group)
-            interval_input.setToolTip(
+            row.addWidget(row_label)
+            start_combo = _history_combo(default_start, value_history, max_width=140, presets=value_presets)
+            start_combo.setToolTip("Start value (hex, e.g. 0x2000).")
+            end_combo = _history_combo(default_end, value_history, max_width=140, presets=value_presets)
+            end_combo.setToolTip("End value (hex, e.g. 0x4000).")
+            interval_combo = _history_combo(default_interval, interval_history, max_width=160, presets=interval_presets)
+            interval_combo.setToolTip(
                 "Interval/step between range values (0 means single value; if start!=end and interval=0, start+end will be used)."
             )
-            interval_input.setMaximumWidth(160)
-            row.addWidget(QLabel("Range", knobs_group))
-            row.addWidget(range_input)
-            row.addWidget(QLabel("Interval", knobs_group))
-            row.addWidget(interval_input)
             row.addStretch(1)
-            return row, range_input, interval_input
+            row.addWidget(start_combo)
+            row.addWidget(end_combo)
+            row.addWidget(interval_combo)
+            row.addStretch(1)
+            return row, start_combo, end_combo, interval_combo
 
         default_gap = SANITIZE_RUNNABLE_FIRST_SEGMENT_GAP
         default_pad = SANITIZE_RUNNABLE_FIRST_SEGMENT_PADDING
         default_icf = SANITIZE_RUNNABLE_FIRST_ICF_WINDOW
         default_jt = SANITIZE_RUNNABLE_FIRST_JUMPTABLE_WINDOW
-        gap_row, self.gap_range_input, self.gap_interval_input = _range_row(
+
+        gap_default = f"0x{default_gap:x}"
+        pad_default = f"0x{default_pad:x}"
+        icf_default = f"0x{default_icf:x}"
+        jt_default = f"0x{default_jt:x}"
+
+        gap_single = _init_text("segment_gap", gap_default)
+        pad_single = _init_text("segment_padding", pad_default)
+        icf_single = _init_text("icf_window", icf_default)
+        jt_single = _init_text("jumptable_window", jt_default)
+
+        gap_value_presets = [
+            f"0x{SANITIZE_RUNNABLE_FIRST_SEGMENT_GAP:x}",
+            "0x0",
+            "0x20",
+            "0x40",
+            "0x80",
+            "0x100",
+            "0x200",
+            "0x400",
+            "0x1000",
+            "0x2000",
+        ]
+        padding_value_presets = [
+            f"0x{SANITIZE_RUNNABLE_FIRST_SEGMENT_PADDING:x}",
+            "0x0",
+            "0x10",
+            "0x20",
+            "0x40",
+            "0x80",
+            "0x100",
+            "0x200",
+            "0x400",
+            "0x800",
+        ]
+        icf_value_presets = [
+            f"0x{SANITIZE_RUNNABLE_FIRST_ICF_WINDOW:x}",
+            "0x0",
+            "0x40",
+            "0x80",
+            "0x100",
+            "0x200",
+            "0x300",
+            "0x600",
+            "0x800",
+            "0x1000",
+        ]
+        jt_value_presets = [
+            f"0x{SANITIZE_RUNNABLE_FIRST_JUMPTABLE_WINDOW:x}",
+            "0x0",
+            "0x40",
+            "0x80",
+            "0x100",
+            "0x200",
+            "0x400",
+            "0x1000",
+            "0x2000",
+            "0x4000",
+        ]
+        interval_presets = [
+            "0x0",
+            "0x1",
+            "0x2",
+            "0x4",
+            "0x8",
+            "0x10",
+            "0x20",
+            "0x40",
+            "0x80",
+            "0x100",
+        ]
+
+        gap_row, self.gap_start_combo, self.gap_end_combo, self.gap_interval_combo = _range_row(
             "Segment gap (bytes):",
-            default_gap,
+            default_start=_init_text("segment_gap_start", gap_single),
+            default_end=_init_text("segment_gap_end", gap_single),
+            default_interval=_init_text("segment_gap_interval", "0x0"),
+            value_history=_init_list("segment_gap_history") or [gap_single],
+            interval_history=_init_list("segment_gap_interval_history"),
+            value_presets=gap_value_presets,
+            interval_presets=interval_presets,
         )
-        pad_row, self.pad_range_input, self.pad_interval_input = _range_row(
+        pad_row, self.pad_start_combo, self.pad_end_combo, self.pad_interval_combo = _range_row(
             "Segment padding (bytes):",
-            default_pad,
+            default_start=_init_text("segment_padding_start", pad_single),
+            default_end=_init_text("segment_padding_end", pad_single),
+            default_interval=_init_text("segment_padding_interval", "0x0"),
+            value_history=_init_list("segment_padding_history") or [pad_single],
+            interval_history=_init_list("segment_padding_interval_history"),
+            value_presets=padding_value_presets,
+            interval_presets=interval_presets,
         )
-        icf_row, self.icf_range_input, self.icf_interval_input = _range_row(
+        icf_row, self.icf_start_combo, self.icf_end_combo, self.icf_interval_combo = _range_row(
             "Indirect CF window (bytes):",
-            default_icf,
+            default_start=_init_text("icf_window_start", icf_single),
+            default_end=_init_text("icf_window_end", icf_single),
+            default_interval=_init_text("icf_window_interval", "0x0"),
+            value_history=_init_list("icf_window_history") or [icf_single],
+            interval_history=_init_list("icf_window_interval_history"),
+            value_presets=icf_value_presets,
+            interval_presets=interval_presets,
         )
-        jt_row, self.jt_range_input, self.jt_interval_input = _range_row(
+        jt_row, self.jt_start_combo, self.jt_end_combo, self.jt_interval_combo = _range_row(
             "Jump-table window (bytes):",
-            default_jt,
+            default_start=_init_text("jumptable_window_start", jt_single),
+            default_end=_init_text("jumptable_window_end", jt_single),
+            default_interval=_init_text("jumptable_window_interval", "0x0"),
+            value_history=_init_list("jumptable_window_history") or [jt_single],
+            interval_history=_init_list("jumptable_window_interval_history"),
+            value_presets=jt_value_presets,
+            interval_presets=interval_presets,
         )
         knobs_layout.addLayout(gap_row)
         knobs_layout.addLayout(pad_row)
@@ -2348,19 +2698,31 @@ class SanitizeConfigDialog(QDialog):
             ):
                 cb.setEnabled(True)
             for entry in (
-                self.gap_range_input,
-                self.gap_interval_input,
-                self.pad_range_input,
-                self.pad_interval_input,
-                self.icf_range_input,
-                self.icf_interval_input,
-                self.jt_range_input,
-                self.jt_interval_input,
+                self.gap_start_combo,
+                self.gap_end_combo,
+                self.gap_interval_combo,
+                self.pad_start_combo,
+                self.pad_end_combo,
+                self.pad_interval_combo,
+                self.icf_start_combo,
+                self.icf_end_combo,
+                self.icf_interval_combo,
+                self.jt_start_combo,
+                self.jt_end_combo,
+                self.jt_interval_combo,
             ):
                 entry.setEnabled(True)
 
         self.runnable_first_checkbox.toggled.connect(_sync_runnable_first_state)
         _sync_runnable_first_state()
+
+        self.keep_only_one_per_nop_checkbox = QCheckBox(
+            "Keep Only One Sanitized Binaries per NOP-Count",
+            self,
+        )
+        self.keep_only_one_per_nop_checkbox.setToolTip(
+            "When enabled, newly generated sanitized binaries that have the same NOP count as an existing one will not be added to the Generated Sanitized Binaries list."
+        )
 
         if isinstance(initial, dict):
             # Conservative defaults already applied above; override with persisted values when present.
@@ -2382,18 +2744,10 @@ class SanitizeConfigDialog(QDialog):
             pi = initial.get("protect_indirect")
             if isinstance(pi, bool):
                 self.protect_indirect_checkbox.setChecked(pi)
-            sg = initial.get("segment_gap")
-            if isinstance(sg, str) and sg.strip():
-                self.gap_range_input.setText(f"{sg.strip()}-{sg.strip()}")
-            sp = initial.get("segment_padding")
-            if isinstance(sp, str) and sp.strip():
-                self.pad_range_input.setText(f"{sp.strip()}-{sp.strip()}")
-            iw = initial.get("icf_window")
-            if isinstance(iw, str) and iw.strip():
-                self.icf_range_input.setText(f"{iw.strip()}-{iw.strip()}")
-            jw = initial.get("jumptable_window")
-            if isinstance(jw, str) and jw.strip():
-                self.jt_range_input.setText(f"{jw.strip()}-{jw.strip()}")
+            keep_unique = initial.get("keep_only_one_per_nop_count")
+            if isinstance(keep_unique, bool):
+                # Store per-project preference; impacts whether duplicates appear in the sanitized list.
+                self.keep_only_one_per_nop_checkbox.setChecked(keep_unique)
             _sync_runnable_first_state()
         options_layout.addStretch(1)
         layout.addWidget(options_group)
@@ -2434,27 +2788,22 @@ class SanitizeConfigDialog(QDialog):
             self.protect_dynlinks_checkbox.setChecked(True)
             self.protect_unwind_checkbox.setChecked(True)
             self.protect_indirect_checkbox.setChecked(True)
-            self.gap_range_input.setText(
-                f"0x{SANITIZE_RUNNABLE_FIRST_SEGMENT_GAP:x}-0x{SANITIZE_RUNNABLE_FIRST_SEGMENT_GAP:x}"
-            )
-            self.pad_range_input.setText(
-                f"0x{SANITIZE_RUNNABLE_FIRST_SEGMENT_PADDING:x}-0x{SANITIZE_RUNNABLE_FIRST_SEGMENT_PADDING:x}"
-            )
-            self.icf_range_input.setText(
-                f"0x{SANITIZE_RUNNABLE_FIRST_ICF_WINDOW:x}-0x{SANITIZE_RUNNABLE_FIRST_ICF_WINDOW:x}"
-            )
-            self.jt_range_input.setText(
-                f"0x{SANITIZE_RUNNABLE_FIRST_JUMPTABLE_WINDOW:x}-0x{SANITIZE_RUNNABLE_FIRST_JUMPTABLE_WINDOW:x}"
-            )
-            for w in (
-                self.gap_interval_input,
-                self.pad_interval_input,
-                self.icf_interval_input,
-                self.jt_interval_input,
-            ):
-                w.setText("0x0")
+            self.gap_start_combo.setCurrentText(f"0x{SANITIZE_RUNNABLE_FIRST_SEGMENT_GAP:x}")
+            self.gap_end_combo.setCurrentText(f"0x{SANITIZE_RUNNABLE_FIRST_SEGMENT_GAP:x}")
+            self.gap_interval_combo.setCurrentText("0x0")
+            self.pad_start_combo.setCurrentText(f"0x{SANITIZE_RUNNABLE_FIRST_SEGMENT_PADDING:x}")
+            self.pad_end_combo.setCurrentText(f"0x{SANITIZE_RUNNABLE_FIRST_SEGMENT_PADDING:x}")
+            self.pad_interval_combo.setCurrentText("0x0")
+            self.icf_start_combo.setCurrentText(f"0x{SANITIZE_RUNNABLE_FIRST_ICF_WINDOW:x}")
+            self.icf_end_combo.setCurrentText(f"0x{SANITIZE_RUNNABLE_FIRST_ICF_WINDOW:x}")
+            self.icf_interval_combo.setCurrentText("0x0")
+            self.jt_start_combo.setCurrentText(f"0x{SANITIZE_RUNNABLE_FIRST_JUMPTABLE_WINDOW:x}")
+            self.jt_end_combo.setCurrentText(f"0x{SANITIZE_RUNNABLE_FIRST_JUMPTABLE_WINDOW:x}")
+            self.jt_interval_combo.setCurrentText("0x0")
 
         self.reset_conservative_button.clicked.connect(_reset_conservative_defaults)
+
+        layout.addWidget(self.keep_only_one_per_nop_checkbox)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Cancel | QDialogButtonBox.Ok, self)
         buttons.accepted.connect(self.accept)
@@ -2481,20 +2830,6 @@ class SanitizeConfigDialog(QDialog):
             except ValueError:
                 return int(fallback)
 
-        def _parse_range(text: str, *, fallback: int) -> tuple[int, int]:
-            raw = (text or "").strip()
-            if not raw:
-                value = int(fallback)
-                return value, value
-            for sep in ("..", "-", ",", ":"):
-                if sep in raw:
-                    left, right = raw.split(sep, 1)
-                    start = _parse_int(left.strip(), fallback=fallback)
-                    end = _parse_int(right.strip(), fallback=start)
-                    return int(start), int(end)
-            value = _parse_int(raw, fallback=fallback)
-            return int(value), int(value)
-
         def _expand(start: int, end: int, step: int) -> list[int]:
             start = max(0, int(start))
             end = max(0, int(end))
@@ -2518,14 +2853,18 @@ class SanitizeConfigDialog(QDialog):
         default_jt = SANITIZE_RUNNABLE_FIRST_JUMPTABLE_WINDOW if runnable_first else SANITIZE_DEFAULT_JUMPTABLE_WINDOW
         default_gap = SANITIZE_RUNNABLE_FIRST_SEGMENT_GAP if runnable_first else HONEY_SEGMENT_MAX_GAP
 
-        gap_start, gap_end = _parse_range(self.gap_range_input.text(), fallback=default_gap)
-        gap_step = _parse_int(self.gap_interval_input.text(), fallback=0)
-        pad_start, pad_end = _parse_range(self.pad_range_input.text(), fallback=default_padding)
-        pad_step = _parse_int(self.pad_interval_input.text(), fallback=0)
-        icf_start, icf_end = _parse_range(self.icf_range_input.text(), fallback=default_icf)
-        icf_step = _parse_int(self.icf_interval_input.text(), fallback=0)
-        jt_start, jt_end = _parse_range(self.jt_range_input.text(), fallback=default_jt)
-        jt_step = _parse_int(self.jt_interval_input.text(), fallback=0)
+        gap_start = _parse_int(self.gap_start_combo.currentText(), fallback=default_gap)
+        gap_end = _parse_int(self.gap_end_combo.currentText(), fallback=gap_start)
+        gap_step = _parse_int(self.gap_interval_combo.currentText(), fallback=0)
+        pad_start = _parse_int(self.pad_start_combo.currentText(), fallback=default_padding)
+        pad_end = _parse_int(self.pad_end_combo.currentText(), fallback=pad_start)
+        pad_step = _parse_int(self.pad_interval_combo.currentText(), fallback=0)
+        icf_start = _parse_int(self.icf_start_combo.currentText(), fallback=default_icf)
+        icf_end = _parse_int(self.icf_end_combo.currentText(), fallback=icf_start)
+        icf_step = _parse_int(self.icf_interval_combo.currentText(), fallback=0)
+        jt_start = _parse_int(self.jt_start_combo.currentText(), fallback=default_jt)
+        jt_end = _parse_int(self.jt_end_combo.currentText(), fallback=jt_start)
+        jt_step = _parse_int(self.jt_interval_combo.currentText(), fallback=0)
 
         # For the single-output path we take the first expanded value; the multi-output
         # path uses sweep_variants().
@@ -2548,6 +2887,7 @@ class SanitizeConfigDialog(QDialog):
             icf_window=icf_window,
             jumptable_window=jumptable_window,
             segment_gap=segment_gap,
+            keep_only_one_per_nop_count=bool(self.keep_only_one_per_nop_checkbox.isChecked()),
         )
 
     def sweep_enabled(self) -> bool:
@@ -2564,20 +2904,6 @@ class SanitizeConfigDialog(QDialog):
                 return int(raw, 0)
             except ValueError:
                 return int(fallback)
-
-        def _parse_range(text: str, *, fallback: int) -> tuple[int, int]:
-            raw = (text or "").strip()
-            if not raw:
-                value = int(fallback)
-                return value, value
-            for sep in ("..", "-", ",", ":"):
-                if sep in raw:
-                    left, right = raw.split(sep, 1)
-                    start = _parse_int(left.strip(), fallback=fallback)
-                    end = _parse_int(right.strip(), fallback=start)
-                    return int(start), int(end)
-            value = _parse_int(raw, fallback=fallback)
-            return int(value), int(value)
 
         def _expand(start: int, end: int, step: int) -> list[int]:
             start = max(0, int(start))
@@ -2596,14 +2922,18 @@ class SanitizeConfigDialog(QDialog):
                 current += step
             return values or [start]
 
-        gap_start, gap_end = _parse_range(self.gap_range_input.text(), fallback=SANITIZE_RUNNABLE_FIRST_SEGMENT_GAP)
-        gap_step = _parse_int(self.gap_interval_input.text(), fallback=0)
-        pad_start, pad_end = _parse_range(self.pad_range_input.text(), fallback=SANITIZE_RUNNABLE_FIRST_SEGMENT_PADDING)
-        pad_step = _parse_int(self.pad_interval_input.text(), fallback=0)
-        icf_start, icf_end = _parse_range(self.icf_range_input.text(), fallback=SANITIZE_RUNNABLE_FIRST_ICF_WINDOW)
-        icf_step = _parse_int(self.icf_interval_input.text(), fallback=0)
-        jt_start, jt_end = _parse_range(self.jt_range_input.text(), fallback=SANITIZE_RUNNABLE_FIRST_JUMPTABLE_WINDOW)
-        jt_step = _parse_int(self.jt_interval_input.text(), fallback=0)
+        gap_start = _parse_int(self.gap_start_combo.currentText(), fallback=SANITIZE_RUNNABLE_FIRST_SEGMENT_GAP)
+        gap_end = _parse_int(self.gap_end_combo.currentText(), fallback=gap_start)
+        gap_step = _parse_int(self.gap_interval_combo.currentText(), fallback=0)
+        pad_start = _parse_int(self.pad_start_combo.currentText(), fallback=SANITIZE_RUNNABLE_FIRST_SEGMENT_PADDING)
+        pad_end = _parse_int(self.pad_end_combo.currentText(), fallback=pad_start)
+        pad_step = _parse_int(self.pad_interval_combo.currentText(), fallback=0)
+        icf_start = _parse_int(self.icf_start_combo.currentText(), fallback=SANITIZE_RUNNABLE_FIRST_ICF_WINDOW)
+        icf_end = _parse_int(self.icf_end_combo.currentText(), fallback=icf_start)
+        icf_step = _parse_int(self.icf_interval_combo.currentText(), fallback=0)
+        jt_start = _parse_int(self.jt_start_combo.currentText(), fallback=SANITIZE_RUNNABLE_FIRST_JUMPTABLE_WINDOW)
+        jt_end = _parse_int(self.jt_end_combo.currentText(), fallback=jt_start)
+        jt_step = _parse_int(self.jt_interval_combo.currentText(), fallback=0)
 
         gaps = _expand(gap_start, gap_end, gap_step)
         pads = _expand(pad_start, pad_end, pad_step)
@@ -2623,7 +2953,13 @@ class SanitizeConfigDialog(QDialog):
 
 
 class RunSanitizedOptionsDialog(QDialog):
-    def __init__(self, parent: QWidget, *, default_run_with_sudo: bool = False) -> None:
+    def __init__(
+        self,
+        parent: QWidget,
+        *,
+        default_run_with_sudo: bool = False,
+        force_assume_works: bool = False,
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Execute Sanitized Binary")
         self.setModal(True)
@@ -2657,7 +2993,7 @@ class RunSanitizedOptionsDialog(QDialog):
         assume_row = QHBoxLayout()
         self.assume_works_checkbox = QCheckBox("Assume works if running after time", execution_group)
         self.assume_works_checkbox.setToolTip(
-            "If enabled, the selected sanitized binary will be marked as working if it is still running after the specified time, then the run will be terminated."
+            "If enabled, the selected sanitized binary will be marked as working if it is still running after the specified time. In batch mode, the run will then be terminated so the batch can continue."
         )
         self.assume_works_ms_spin = QSpinBox(execution_group)
         self.assume_works_ms_spin.setRange(1, 10000)
@@ -2675,7 +3011,10 @@ class RunSanitizedOptionsDialog(QDialog):
             self.assume_works_ms_spin.setEnabled(bool(self.assume_works_checkbox.isChecked()))
 
         self.assume_works_checkbox.toggled.connect(_sync_assume_enabled)
-        self.assume_works_checkbox.setChecked(False)
+        self.assume_works_checkbox.setChecked(bool(force_assume_works))
+        if force_assume_works:
+            # Batch runs need this behavior to avoid stalling the batch on long-running targets.
+            self.assume_works_checkbox.setEnabled(False)
         _sync_assume_enabled()
         layout.addWidget(execution_group)
 
@@ -2760,6 +3099,242 @@ class RunSanitizedOptionsDialog(QDialog):
             assume_works_if_running=bool(self.assume_works_checkbox.isChecked()),
             assume_works_after_ms=int(self.assume_works_ms_spin.value()),
         )
+
+
+class MetricsSeries(NamedTuple):
+    label: str
+    metrics: dict[str, object]
+
+
+class MetricsViewerDialog(QDialog):
+    def __init__(self, parent: QWidget, series: list[MetricsSeries]) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("View Metrics")
+        self.setModal(True)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+
+        header = QLabel("Runtime metrics for selected runs.", self)
+        header.setWordWrap(True)
+        layout.addWidget(header)
+
+        charts_layout = QVBoxLayout()
+        charts_layout.setSpacing(10)
+        layout.addLayout(charts_layout)
+
+        charts_layout.addWidget(
+            self._build_chart_widget(
+                series,
+                title="Wall Time",
+                y_label="Milliseconds (ms)",
+                value_getter=lambda metrics: metrics.get("wall_time_ms"),
+            )
+        )
+        charts_layout.addWidget(
+            self._build_chart_widget(
+                series,
+                title="CPU Time",
+                y_label="Seconds (s)",
+                value_getter=lambda metrics: (
+                    (metrics.get("cpu_user_s") or 0) + (metrics.get("cpu_system_s") or 0)
+                ),
+            )
+        )
+
+        charts_layout.addWidget(
+            self._build_line_chart_widget(
+                series,
+                title="CPU Load (1s)",
+                x_label="Seconds (s)",
+                y_label="CPU (%)",
+                samples_getter=lambda metrics: metrics.get("cpu_load_1s"),
+            )
+        )
+        charts_layout.addWidget(
+            self._build_chart_widget(
+                series,
+                title="Peak RSS",
+                y_label="MiB",
+                value_getter=lambda metrics: (metrics.get("peak_rss_bytes") or 0),
+                value_transform=lambda value: float(value) / (1024.0 * 1024.0),
+            )
+        )
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Close, self)
+        buttons.rejected.connect(self.reject)
+        buttons.accepted.connect(self.accept)
+        layout.addWidget(buttons)
+
+        self.resize(900, 760)
+
+    @staticmethod
+    def _build_line_chart_widget(
+        series: list[MetricsSeries],
+        *,
+        title: str,
+        x_label: str,
+        y_label: str,
+        samples_getter: Callable[[dict[str, object]], object],
+    ) -> QWidget:
+        try:
+            from PySide6.QtCharts import QChart, QChartView, QLineSeries, QValueAxis
+        except Exception:
+            widget = QLabel(
+                f"{title}: QtCharts is not available in this environment.",
+                None,
+            )
+            widget.setWordWrap(True)
+            return widget
+
+        chart = QChart()
+        chart.setTitle(title)
+
+        any_points = False
+        max_x = 0.0
+        max_y = 0.0
+
+        for item in series:
+            raw_samples = samples_getter(item.metrics)
+            if not isinstance(raw_samples, list):
+                continue
+
+            line = QLineSeries()
+            line.setName(item.label)
+            points_added = 0
+            for sample in raw_samples:
+                x_obj: object | None = None
+                y_obj: object | None = None
+                if isinstance(sample, dict):
+                    x_obj = sample.get("t_s")
+                    y_obj = sample.get("cpu_percent")
+                elif isinstance(sample, (list, tuple)) and len(sample) == 2:
+                    x_obj, y_obj = sample
+                else:
+                    continue
+                try:
+                    x = float(x_obj)  # type: ignore[arg-type]
+                    y = float(y_obj)  # type: ignore[arg-type]
+                except Exception:
+                    continue
+                line.append(x, y)
+                points_added += 1
+                if x > max_x:
+                    max_x = x
+                if y > max_y:
+                    max_y = y
+
+            if points_added:
+                chart.addSeries(line)
+                any_points = True
+
+        if not any_points:
+            widget = QLabel(f"{title}: (no data)", None)
+            widget.setStyleSheet("color: #666;")
+            return widget
+
+        axis_x = QValueAxis()
+        axis_x.setTitleText(x_label)
+        axis_x.setRange(0.0, max(1.0, max_x))
+
+        axis_y = QValueAxis()
+        axis_y.setTitleText(y_label)
+        axis_y.setRange(0.0, max(1.0, max_y * 1.1))
+
+        chart.addAxis(axis_x, Qt.AlignBottom)
+        chart.addAxis(axis_y, Qt.AlignLeft)
+        for s in chart.series():
+            s.attachAxis(axis_x)
+            s.attachAxis(axis_y)
+
+        chart.legend().setVisible(len(chart.series()) > 1)
+
+        view = QChartView(chart)
+        view.setRenderHint(QPainter.Antialiasing)
+        return view
+
+    @staticmethod
+    def _build_chart_widget(
+        series: list[MetricsSeries],
+        *,
+        title: str,
+        y_label: str,
+        value_getter: Callable[[dict[str, object]], object],
+        value_transform: Callable[[float], float] | None = None,
+    ) -> QWidget:
+        try:
+            from PySide6.QtCharts import (
+                QChart,
+                QChartView,
+                QBarSeries,
+                QBarSet,
+                QBarCategoryAxis,
+                QValueAxis,
+            )
+        except Exception:
+            widget = QLabel(
+                f"{title}: QtCharts is not available in this environment.",
+                None,
+            )
+            widget.setWordWrap(True)
+            return widget
+
+        labels: list[str] = []
+        values: list[float] = []
+
+        for item in series:
+            raw = value_getter(item.metrics)
+            try:
+                value = float(raw)
+            except Exception:
+                continue
+            if value_transform is not None:
+                try:
+                    value = float(value_transform(value))
+                except Exception:
+                    continue
+            # Filter out non-positive placeholder values for charts.
+            if value <= 0:
+                continue
+            labels.append(item.label)
+            values.append(value)
+
+        if not labels:
+            widget = QLabel(f"{title}: (no data)", None)
+            widget.setStyleSheet("color: #666;")
+            return widget
+
+        bar_set = QBarSet(title)
+        for value in values:
+            bar_set.append(value)
+
+        bar_series = QBarSeries()
+        bar_series.append(bar_set)
+
+        chart = QChart()
+        chart.addSeries(bar_series)
+        chart.setTitle(title)
+        chart.legend().setVisible(False)
+
+        axis_x = QBarCategoryAxis()
+        axis_x.append(labels)
+        axis_x.setTitleText("Run")
+        axis_x.setLabelsAngle(-45)
+
+        axis_y = QValueAxis()
+        axis_y.setTitleText(y_label)
+        max_value = max(values) if values else 1.0
+        axis_y.setRange(0, max_value * 1.1)
+
+        chart.addAxis(axis_x, Qt.AlignBottom)
+        bar_series.attachAxis(axis_x)
+        chart.addAxis(axis_y, Qt.AlignLeft)
+        bar_series.attachAxis(axis_y)
+
+        view = QChartView(chart)
+        view.setRenderHint(QPainter.Antialiasing)
+        view.setMinimumHeight(220)
+        return view
 
 
 class _BinaryInstructionResolver:
@@ -2965,12 +3540,16 @@ class InstructionPreviewDialog(QDialog):
         widget = QWidget(self)
         layout = QVBoxLayout(widget)
         table = QTableWidget(0, 4, widget)
+        table.setSortingEnabled(True)
         table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         table.setSelectionBehavior(QAbstractItemView.SelectRows)
         table.setSelectionMode(QAbstractItemView.SingleSelection)
         table.verticalHeader().setVisible(False)
         table.setHorizontalHeaderLabels(["Section", self._overview_binary_label, self._overview_trace_label, "Status"])
         header = table.horizontalHeader()
+        header.setSectionsClickable(True)
+        header.setSortIndicatorShown(True)
+        header.setSortIndicator(-1, Qt.AscendingOrder)
         header.setStretchLastSection(True)
         header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
@@ -2997,6 +3576,9 @@ class InstructionPreviewDialog(QDialog):
         table = getattr(self, "overview_table", None)
         if table is None:
             return
+        was_sorting = bool(table.isSortingEnabled())
+        if was_sorting:
+            table.setSortingEnabled(False)
         sections = list(self._sections)
         table.setRowCount(len(sections))
         if hasattr(self, "no_sections_label"):
@@ -3005,6 +3587,8 @@ class InstructionPreviewDialog(QDialog):
             table.setVisible(has_sections)
         if not sections:
             table.clearContents()
+            if was_sorting:
+                table.setSortingEnabled(True)
             if done_callback:
                 QTimer.singleShot(0, done_callback)
             return
@@ -3027,6 +3611,8 @@ class InstructionPreviewDialog(QDialog):
                 progress_dialog.close()
                 progress_dialog = None
             self._finalize_overview_selection()
+            if was_sorting:
+                table.setSortingEnabled(True)
             if progress_callback and sections:
                 total = len(sections)
                 progress_callback(f"Overview rows ready ({total}/{total})")
@@ -3098,6 +3684,7 @@ class InstructionPreviewDialog(QDialog):
         widget = QWidget(self)
         layout = QVBoxLayout(widget)
         table = QTableWidget(0, 3, widget)
+        table.setSortingEnabled(True)
         table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         table.setSelectionBehavior(QAbstractItemView.SelectRows)
         table.setSelectionMode(QAbstractItemView.ExtendedSelection)
@@ -3106,6 +3693,9 @@ class InstructionPreviewDialog(QDialog):
         table.setContextMenuPolicy(Qt.CustomContextMenu)
         table.customContextMenuRequested.connect(self._show_detail_context_menu)
         header = table.horizontalHeader()
+        header.setSectionsClickable(True)
+        header.setSortIndicatorShown(True)
+        header.setSortIndicator(-1, Qt.AscendingOrder)
         header.setStretchLastSection(True)
         header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
@@ -3929,11 +4519,16 @@ class InstructionPreviewDialog(QDialog):
             if done_callback:
                 done_callback()
             return
+        was_sorting = bool(table.isSortingEnabled())
+        if was_sorting:
+            table.setSortingEnabled(False)
         total_rows = len(rows)
         table.clearContents()
         table.setRowCount(total_rows)
         if total_rows == 0:
             table.resizeRowsToContents()
+            if was_sorting:
+                table.setSortingEnabled(True)
             if progress_callback:
                 progress_callback("No detail rows to populate.")
             if done_callback:
@@ -3949,6 +4544,8 @@ class InstructionPreviewDialog(QDialog):
 
         def _finalize_rows() -> None:
             table.resizeRowsToContents()
+            if was_sorting:
+                table.setSortingEnabled(True)
             if progress_callback:
                 progress_callback(f"Detail rows ready ({total_rows}/{total_rows})")
             if done_callback:
@@ -4261,11 +4858,15 @@ class SequenceAnalyzerDialog(QDialog):
         search_row.addWidget(self.binary_filter_input)
         left_panel.addLayout(search_row)
         self.binary_table = QTableWidget(len(self._binary_rows), 3, self)
+        self.binary_table.setSortingEnabled(True)
         self.binary_table.setHorizontalHeaderLabels(["#", "Binary Address", "Binary Instruction"])
         self.binary_table.verticalHeader().setVisible(False)
         self.binary_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.binary_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         header = self.binary_table.horizontalHeader()
+        header.setSectionsClickable(True)
+        header.setSortIndicatorShown(True)
+        header.setSortIndicator(-1, Qt.AscendingOrder)
         header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.Stretch)
@@ -4286,11 +4887,15 @@ class SequenceAnalyzerDialog(QDialog):
         matches_label.setStyleSheet("font-weight: bold;")
         right_panel.addWidget(matches_label)
         self.results_table = QTableWidget(0, 3, self)
+        self.results_table.setSortingEnabled(True)
         self.results_table.setHorizontalHeaderLabels(["Trace Start", "Offset", "Preview"])
         self.results_table.verticalHeader().setVisible(False)
         self.results_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.results_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         results_header = self.results_table.horizontalHeader()
+        results_header.setSectionsClickable(True)
+        results_header.setSortIndicatorShown(True)
+        results_header.setSortIndicator(-1, Qt.AscendingOrder)
         results_header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
         results_header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
         results_header.setSectionResizeMode(2, QHeaderView.Stretch)
@@ -4335,11 +4940,15 @@ class SequenceAnalyzerDialog(QDialog):
         header_row.addWidget(self.ngram_close_button)
         ngram_container_layout.addLayout(header_row)
         self.ngram_results_tree = QTreeWidget(self.ngram_results_container)
+        self.ngram_results_tree.setSortingEnabled(True)
         self.ngram_results_tree.setHeaderLabels(["Location", "Details"])
         self.ngram_results_tree.setAlternatingRowColors(True)
         self.ngram_results_tree.setRootIsDecorated(True)
         ngram_header = self.ngram_results_tree.header()
         if ngram_header is not None:
+            ngram_header.setSectionsClickable(True)
+            ngram_header.setSortIndicatorShown(True)
+            ngram_header.setSortIndicator(-1, Qt.AscendingOrder)
             ngram_header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
             ngram_header.setSectionResizeMode(1, QHeaderView.Stretch)
         self.ngram_results_tree.itemActivated.connect(self._handle_ngram_item_activated)
@@ -4884,6 +5493,12 @@ class SequenceAnalyzerDialog(QDialog):
 
     def _populate_results(self, matches: list[dict[str, object]], *, truncated: bool = False) -> None:
         table = self.results_table
+        was_sorting = bool(table.isSortingEnabled())
+        header = table.horizontalHeader()
+        sort_section = int(header.sortIndicatorSection()) if header is not None else -1
+        sort_order = header.sortIndicatorOrder() if header is not None else Qt.AscendingOrder
+        if was_sorting:
+            table.setSortingEnabled(False)
         table.setUpdatesEnabled(False)
         try:
             self._matches = list(matches)
@@ -4901,6 +5516,13 @@ class SequenceAnalyzerDialog(QDialog):
                 table.setItem(row_idx, 2, preview_item)
         finally:
             table.setUpdatesEnabled(True)
+            if was_sorting:
+                table.setSortingEnabled(True)
+                if header is not None:
+                    if sort_section >= 0:
+                        header.setSortIndicator(sort_section, sort_order)
+                    else:
+                        header.setSortIndicator(-1, Qt.AscendingOrder)
         table.resizeRowsToContents()
         if self._matches:
             status = f"Found {len(self._matches)} match"
@@ -5030,10 +5652,16 @@ class BinaryInstructionStats(NamedTuple):
 
 
 class App(QMainWindow):
+    console_append_requested = Signal(str)
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("PIN Instruction Logger")
         self.resize(1280, 800)
+        try:
+            self.console_append_requested.connect(self._append_console_on_gui, Qt.QueuedConnection)
+        except Exception:
+            pass
         self.config_manager = ConfigManager()
         self.config: AppConfig = self.config_manager.load()
         self.active_project: str = self.config.active_project or self.config.projects[0]
@@ -5082,6 +5710,7 @@ class App(QMainWindow):
         self._sanitized_batch_total = 0
         self._sanitized_batch_completed = 0
         self._sanitized_batch_results: list[BatchRunResult] = []
+        self._sanitized_batch_inter_run_delay_ms = SANITIZED_BATCH_INTER_RUN_DELAY_MS_DEFAULT
         self._current_batch_output_timer: QTimer | None = None
         self._current_batch_output_buffer: deque[str] = deque()
         self._current_batch_output_dropped = 0
@@ -5494,8 +6123,14 @@ class App(QMainWindow):
         self.show_segments_button.setEnabled(False)
         self.show_segments_button.clicked.connect(self._handle_show_segments_clicked)
         self.log_segments_table = QTableWidget(0, 4, preview_panel)
+        self.log_segments_table.setSortingEnabled(True)
         self.log_segments_table.setHorizontalHeaderLabels(["#", "Start", "End", "Length"])
         _prepare_header_for_autosize(self.log_segments_table.horizontalHeader())
+        segments_header_widget = self.log_segments_table.horizontalHeader()
+        if segments_header_widget is not None:
+            segments_header_widget.setSectionsClickable(True)
+            segments_header_widget.setSortIndicatorShown(True)
+            segments_header_widget.setSortIndicator(-1, Qt.AscendingOrder)
         self.log_segments_table.verticalHeader().setVisible(False)
         self.log_segments_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.log_segments_table.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -5525,6 +6160,7 @@ class App(QMainWindow):
         honey_layout = QVBoxLayout(honey_tab)
         self.honey_entries_label = QLabel("", honey_tab)
         self.honey_list = QTreeWidget(honey_tab)
+        self.honey_list.setSortingEnabled(True)
         self.honey_list.setColumnCount(7)
         self.honey_list.setHeaderLabels(
             [
@@ -5541,6 +6177,11 @@ class App(QMainWindow):
         self.honey_list.setSelectionMode(QAbstractItemView.SingleSelection)
         self.honey_list.setAlternatingRowColors(True)
         _prepare_header_for_autosize(self.honey_list.header(), stretch_last=True)
+        honey_header = self.honey_list.header()
+        if honey_header is not None:
+            honey_header.setSectionsClickable(True)
+            honey_header.setSortIndicatorShown(True)
+            honey_header.setSortIndicator(-1, Qt.AscendingOrder)
         honey_buttons = QHBoxLayout()
         indicator_widget = QWidget(honey_tab)
         indicator_layout = QHBoxLayout(indicator_widget)
@@ -5558,6 +6199,7 @@ class App(QMainWindow):
         self.honey_run_sanitized_button = QPushButton("Execute Sanitized", honey_tab)
         self.honey_reveal_button = QPushButton("Reveal Sanitized", honey_tab)
         self.honey_compare_button = QPushButton("Compare Logs", honey_tab)
+        self.honey_view_metrics_button = QPushButton("View Metrics", honey_tab)
         honey_buttons.addWidget(indicator_widget)
         honey_buttons.addWidget(self.honey_preview_button)
         honey_buttons.addWidget(self.honey_sanitize_button)
@@ -5587,6 +6229,7 @@ class App(QMainWindow):
         self.honey_sanitized_list_label = QLabel("Generated Sanitized Binaries", honey_tab)
         self.honey_sanitized_list_label.setStyleSheet("font-weight: bold;")
         self.honey_sanitized_list = QTreeWidget(honey_tab)
+        self.honey_sanitized_list.setSortingEnabled(True)
         self.honey_sanitized_list.setColumnCount(12)
         self.honey_sanitized_list.setHeaderLabels([
             "Sanitized Binary",
@@ -5603,6 +6246,11 @@ class App(QMainWindow):
             "Works",
         ])
         _prepare_header_for_autosize(self.honey_sanitized_list.header(), stretch_last=True)
+        sanitized_header = self.honey_sanitized_list.header()
+        if sanitized_header is not None:
+            sanitized_header.setSectionsClickable(True)
+            sanitized_header.setSortIndicatorShown(True)
+            sanitized_header.setSortIndicator(-1, Qt.AscendingOrder)
         self.honey_sanitized_list.setRootIsDecorated(False)
         self.honey_sanitized_list.setAlternatingRowColors(True)
         self.honey_sanitized_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
@@ -5620,6 +6268,7 @@ class App(QMainWindow):
         sanitized_actions.addWidget(self.honey_reveal_button)
         sanitized_actions.addWidget(self.honey_run_sanitized_button)
         sanitized_actions.addWidget(self.honey_compare_button)
+        sanitized_actions.addWidget(self.honey_view_metrics_button)
         honey_layout.addLayout(sanitized_actions)
         honey_layout.addStretch()
 
@@ -5652,6 +6301,7 @@ class App(QMainWindow):
         self.honey_run_sanitized_button.clicked.connect(self.execute_sanitized_binary)
         self.honey_reveal_button.clicked.connect(self.reveal_sanitized_binary)
         self.honey_compare_button.clicked.connect(self.compare_sanitized_logs)
+        self.honey_view_metrics_button.clicked.connect(self.view_sanitized_metrics)
         self.honey_delete_sanitized_button.clicked.connect(self.delete_sanitized_binary)
         self.honey_compare_parent_button.clicked.connect(self.compare_sanitized_to_parent)
         self._update_sanitized_action_state()
@@ -5915,15 +6565,27 @@ class App(QMainWindow):
                     except OSError:
                         pass
             assert proc.stdout is not None
+            output_lines: list[str] = []
             for line in proc.stdout:
                 clean = line.rstrip()
                 if clean:
+                    output_lines.append(clean)
                     self._append_console(clean)
             proc.wait()
             if proc.returncode != 0:
-                raise RuntimeError("Pre-run command exited with non-zero status")
+                combined = "\n".join(output_lines).strip()
+                if run_with_sudo and self._password_error_requires_retry(combined):
+                    self._append_console("Sudo authentication failed; clearing cached password.")
+                    self._clear_cached_sudo_password()
+                details = output_lines[-1] if output_lines else "(no output)"
+                raise RuntimeError(f"Pre-run command exited with non-zero status: {details}")
             QMessageBox.information(self, "Pre-run succeeded", "The pre-run command executed successfully.")
         except Exception as exc:
+            try:
+                if run_with_sudo and self._password_error_requires_retry(str(exc) or ""):
+                    self._clear_cached_sudo_password()
+            except Exception:
+                pass
             QMessageBox.critical(self, "Pre-run failed", str(exc))
             self._append_console(f"Pre-run test failed: {exc}")
 
@@ -6803,6 +7465,31 @@ class App(QMainWindow):
             "segment_gap": str(getattr(settings, "sanitize_segment_gap", f"0x{SANITIZE_RUNNABLE_FIRST_SEGMENT_GAP:x}")),
             "icf_window": str(getattr(settings, "sanitize_icf_window", "0x400")),
             "jumptable_window": str(getattr(settings, "sanitize_jumptable_window", "0x800")),
+            "segment_gap_start": str(getattr(settings, "sanitize_segment_gap_start", "")) or "",
+            "segment_gap_end": str(getattr(settings, "sanitize_segment_gap_end", "")) or "",
+            "segment_gap_interval": str(getattr(settings, "sanitize_segment_gap_interval", "0x0")) or "0x0",
+            "segment_gap_history": list(getattr(settings, "sanitize_segment_gap_history", []) or []),
+            "segment_gap_interval_history": list(getattr(settings, "sanitize_segment_gap_interval_history", []) or []),
+            "segment_padding_start": str(getattr(settings, "sanitize_segment_padding_start", "")) or "",
+            "segment_padding_end": str(getattr(settings, "sanitize_segment_padding_end", "")) or "",
+            "segment_padding_interval": str(getattr(settings, "sanitize_segment_padding_interval", "0x0")) or "0x0",
+            "segment_padding_history": list(getattr(settings, "sanitize_segment_padding_history", []) or []),
+            "segment_padding_interval_history": list(
+                getattr(settings, "sanitize_segment_padding_interval_history", []) or []
+            ),
+            "icf_window_start": str(getattr(settings, "sanitize_icf_window_start", "")) or "",
+            "icf_window_end": str(getattr(settings, "sanitize_icf_window_end", "")) or "",
+            "icf_window_interval": str(getattr(settings, "sanitize_icf_window_interval", "0x0")) or "0x0",
+            "icf_window_history": list(getattr(settings, "sanitize_icf_window_history", []) or []),
+            "icf_window_interval_history": list(getattr(settings, "sanitize_icf_window_interval_history", []) or []),
+            "jumptable_window_start": str(getattr(settings, "sanitize_jumptable_window_start", "")) or "",
+            "jumptable_window_end": str(getattr(settings, "sanitize_jumptable_window_end", "")) or "",
+            "jumptable_window_interval": str(getattr(settings, "sanitize_jumptable_window_interval", "0x0")) or "0x0",
+            "jumptable_window_history": list(getattr(settings, "sanitize_jumptable_window_history", []) or []),
+            "jumptable_window_interval_history": list(
+                getattr(settings, "sanitize_jumptable_window_interval_history", []) or []
+            ),
+            "keep_only_one_per_nop_count": bool(getattr(settings, "sanitize_keep_only_one_per_nop_count", False)),
         }
         config_dialog = SanitizeConfigDialog(
             self,
@@ -6836,6 +7523,88 @@ class App(QMainWindow):
         settings.sanitize_segment_gap = f"0x{int(sanitize_options.segment_gap):x}"
         settings.sanitize_icf_window = f"0x{int(sanitize_options.icf_window):x}"
         settings.sanitize_jumptable_window = f"0x{int(sanitize_options.jumptable_window):x}"
+        try:
+            def _push(history: list[str], value: str, *, limit: int = 20) -> list[str]:
+                v = (value or "").strip()
+                if not v:
+                    return history
+                out: list[str] = [v]
+                for item in history:
+                    if not item:
+                        continue
+                    if str(item).strip().lower() == v.lower():
+                        continue
+                    out.append(str(item).strip())
+                    if len(out) >= limit:
+                        break
+                return out
+
+            settings.sanitize_segment_gap_start = (config_dialog.gap_start_combo.currentText() or "").strip()
+            settings.sanitize_segment_gap_end = (config_dialog.gap_end_combo.currentText() or "").strip()
+            settings.sanitize_segment_gap_interval = (config_dialog.gap_interval_combo.currentText() or "0x0").strip() or "0x0"
+            settings.sanitize_segment_gap_history = _push(
+                list(getattr(settings, "sanitize_segment_gap_history", []) or []),
+                settings.sanitize_segment_gap_start,
+            )
+            settings.sanitize_segment_gap_history = _push(settings.sanitize_segment_gap_history, settings.sanitize_segment_gap_end)
+            settings.sanitize_segment_gap_interval_history = _push(
+                list(getattr(settings, "sanitize_segment_gap_interval_history", []) or []),
+                settings.sanitize_segment_gap_interval,
+            )
+
+            settings.sanitize_segment_padding_start = (config_dialog.pad_start_combo.currentText() or "").strip()
+            settings.sanitize_segment_padding_end = (config_dialog.pad_end_combo.currentText() or "").strip()
+            settings.sanitize_segment_padding_interval = (
+                config_dialog.pad_interval_combo.currentText() or "0x0"
+            ).strip() or "0x0"
+            settings.sanitize_segment_padding_history = _push(
+                list(getattr(settings, "sanitize_segment_padding_history", []) or []),
+                settings.sanitize_segment_padding_start,
+            )
+            settings.sanitize_segment_padding_history = _push(
+                settings.sanitize_segment_padding_history, settings.sanitize_segment_padding_end
+            )
+            settings.sanitize_segment_padding_interval_history = _push(
+                list(getattr(settings, "sanitize_segment_padding_interval_history", []) or []),
+                settings.sanitize_segment_padding_interval,
+            )
+
+            settings.sanitize_icf_window_start = (config_dialog.icf_start_combo.currentText() or "").strip()
+            settings.sanitize_icf_window_end = (config_dialog.icf_end_combo.currentText() or "").strip()
+            settings.sanitize_icf_window_interval = (
+                config_dialog.icf_interval_combo.currentText() or "0x0"
+            ).strip() or "0x0"
+            settings.sanitize_icf_window_history = _push(
+                list(getattr(settings, "sanitize_icf_window_history", []) or []),
+                settings.sanitize_icf_window_start,
+            )
+            settings.sanitize_icf_window_history = _push(
+                settings.sanitize_icf_window_history, settings.sanitize_icf_window_end
+            )
+            settings.sanitize_icf_window_interval_history = _push(
+                list(getattr(settings, "sanitize_icf_window_interval_history", []) or []),
+                settings.sanitize_icf_window_interval,
+            )
+
+            settings.sanitize_jumptable_window_start = (config_dialog.jt_start_combo.currentText() or "").strip()
+            settings.sanitize_jumptable_window_end = (config_dialog.jt_end_combo.currentText() or "").strip()
+            settings.sanitize_jumptable_window_interval = (
+                config_dialog.jt_interval_combo.currentText() or "0x0"
+            ).strip() or "0x0"
+            settings.sanitize_jumptable_window_history = _push(
+                list(getattr(settings, "sanitize_jumptable_window_history", []) or []),
+                settings.sanitize_jumptable_window_start,
+            )
+            settings.sanitize_jumptable_window_history = _push(
+                settings.sanitize_jumptable_window_history, settings.sanitize_jumptable_window_end
+            )
+            settings.sanitize_jumptable_window_interval_history = _push(
+                list(getattr(settings, "sanitize_jumptable_window_interval_history", []) or []),
+                settings.sanitize_jumptable_window_interval,
+            )
+        except Exception:
+            pass
+        settings.sanitize_keep_only_one_per_nop_count = bool(getattr(sanitize_options, "keep_only_one_per_nop_count", False))
         self.config_manager.save(self.config)
         output_path = default_output_path
         if sanitize_options.output_name:
@@ -6888,11 +7657,12 @@ class App(QMainWindow):
                 self._refresh_entry_views(target.entry_id)
 
             def _on_finished(payload: object) -> None:
-                dialog.mark_finished("Sweep complete.")
                 summary = payload if isinstance(payload, dict) else {}
+                cancelled = bool(summary.get("cancelled", False))
+                dialog.mark_finished("Sweep cancelled." if cancelled else "Sweep complete.")
                 QMessageBox.information(
                     self,
-                    "Sweep complete",
+                    "Sweep cancelled" if cancelled else "Sweep complete",
                     f"Generated {int(summary.get('successes', 0) or 0)} binary(ies); {int(summary.get('failures', 0) or 0)} failed.",
                 )
                 self._cleanup_sweep_worker()
@@ -6901,10 +7671,12 @@ class App(QMainWindow):
             worker.finished.connect(_on_finished, Qt.QueuedConnection)
             thread.finished.connect(self._cleanup_sweep_worker)
             dialog.finished.connect(self._cleanup_sweep_worker)
+            dialog.stop_requested.connect(self._request_cancel_current_sweep, Qt.QueuedConnection)
             thread.started.connect(worker.run)
 
             self._current_sweep_thread = thread
             self._current_sweep_worker = worker
+            self._current_sweep_dialog = dialog
             self._append_console(
                 f"Starting sanitization sweep for '{entry.name}'. Output template: {output_path}"
             )
@@ -6934,9 +7706,11 @@ class App(QMainWindow):
         worker.progress.connect(dialog.update_status)
         worker.progress.connect(self._append_console)
         worker.succeeded.connect(self._handle_sanitize_success)
+        worker.cancelled.connect(self._handle_sanitize_cancelled)
         worker.failed.connect(self._handle_sanitize_failure)
         thread.finished.connect(self._cleanup_sanitize_worker)
         dialog.finished.connect(self._cleanup_sanitize_worker)
+        dialog.stop_requested.connect(self._request_cancel_current_sanitization, Qt.QueuedConnection)
         thread.started.connect(worker.run)
 
         self._current_sanitize_thread = thread
@@ -7409,6 +8183,7 @@ class App(QMainWindow):
         use_sudo: bool = False,
         module_filters: list[str] | None = None,
         pre_run_command: str | None = None,
+        run_metrics: dict[str, object] | None = None,
     ) -> None:
         actual_log = log_path or str(self._project_log_path())
         timestamp = datetime.now()
@@ -7426,6 +8201,7 @@ class App(QMainWindow):
             use_sudo=use_sudo,
             module_filters=module_filters,
             pre_run_command=pre_run_command,
+            run_metrics=run_metrics,
         )
         self.run_entries.append(entry)
         self._refresh_entry_views(entry.entry_id)
@@ -7681,6 +8457,7 @@ class App(QMainWindow):
         reveal_button = getattr(self, "honey_reveal_button", None)
         run_button = getattr(self, "honey_run_sanitized_button", None)
         compare_logs_button = getattr(self, "honey_compare_button", None)
+        view_metrics_button = getattr(self, "honey_view_metrics_button", None)
 
         selections = self._selected_sanitized_outputs()
         multi = len(selections) > 1
@@ -7703,6 +8480,8 @@ class App(QMainWindow):
             delete_button.setEnabled(bool(selections) and can_delete)
         if run_button is not None:
             run_button.setEnabled(bool(selections) and can_execute)
+        if view_metrics_button is not None:
+            view_metrics_button.setEnabled(bool(selections) and not busy)
 
         if multi:
             if compare_button is not None:
@@ -7721,6 +8500,85 @@ class App(QMainWindow):
             entry = self._current_honey_entry()
             compare_ready = self._resolve_compare_pair(entry) is not None
             compare_logs_button.setEnabled(bool(entry and compare_ready) and not busy)
+
+    def _latest_sanitized_run_with_metrics(self, *, parent_entry_id: str, sanitized_binary_path: str) -> RunEntry | None:
+        target_path = (sanitized_binary_path or "").strip()
+        if not target_path:
+            return None
+        try:
+            target_resolved = str(Path(target_path).resolve())
+        except Exception:
+            target_resolved = target_path
+        candidates: list[RunEntry] = []
+        for entry in self.run_entries:
+            if not getattr(entry, "is_sanitized_run", False):
+                continue
+            if str(getattr(entry, "parent_entry_id", "") or "") != str(parent_entry_id):
+                continue
+            raw_entry_path = str(getattr(entry, "sanitized_binary_path", "") or "")
+            try:
+                entry_resolved = str(Path(raw_entry_path).resolve())
+            except Exception:
+                entry_resolved = raw_entry_path
+            if entry_resolved != target_resolved:
+                continue
+            if getattr(entry, "run_metrics", None) is None:
+                continue
+            candidates.append(entry)
+        if not candidates:
+            return None
+        candidates.sort(key=lambda e: getattr(e, "timestamp", datetime.min) or datetime.min, reverse=True)
+        return candidates[0]
+
+    def _metrics_series_for_sanitized_selections(
+        self,
+        selections: list[tuple[RunEntry, SanitizedBinaryOutput]],
+    ) -> list[MetricsSeries]:
+        series: list[MetricsSeries] = []
+        included_original: set[str] = set()
+        for parent_entry, output in selections:
+            if parent_entry.entry_id not in included_original:
+                metrics = getattr(parent_entry, "run_metrics", None)
+                if isinstance(metrics, dict) and metrics:
+                    series.append(MetricsSeries(label=f"{parent_entry.label()} (Original)", metrics=metrics))
+                included_original.add(parent_entry.entry_id)
+
+            sanitized_path = getattr(output, "output_path", None)
+            if not sanitized_path:
+                continue
+            latest = self._latest_sanitized_run_with_metrics(
+                parent_entry_id=parent_entry.entry_id,
+                sanitized_binary_path=str(sanitized_path),
+            )
+            if latest is None:
+                continue
+            metrics = getattr(latest, "run_metrics", None)
+            if not isinstance(metrics, dict) or not metrics:
+                continue
+            label = Path(str(sanitized_path)).name or str(sanitized_path)
+            series.append(MetricsSeries(label=label, metrics=metrics))
+        return series
+
+    def view_sanitized_metrics(self) -> None:
+        selections = self._selected_sanitized_outputs()
+        if not selections:
+            QMessageBox.information(
+                self,
+                "No sanitized binary selected",
+                "Select one or more sanitized binaries in the list to view metrics.",
+            )
+            return
+        metrics_series = self._metrics_series_for_sanitized_selections(selections)
+        if not metrics_series:
+            QMessageBox.information(
+                self,
+                "No metrics available",
+                "No runtime metrics were found for the selected items. Run the original/sanitized binaries with metrics enabled to populate graphs.",
+            )
+            return
+
+        dialog = MetricsViewerDialog(self, metrics_series)
+        dialog.exec()
 
     def _handle_sanitized_output_item_changed(self, item: QTreeWidgetItem, column: int) -> None:
         if item is None or column != 11:
@@ -10272,6 +11130,31 @@ class App(QMainWindow):
             "segment_gap": str(getattr(settings, "sanitize_segment_gap", f"0x{SANITIZE_RUNNABLE_FIRST_SEGMENT_GAP:x}")),
             "icf_window": str(getattr(settings, "sanitize_icf_window", "0x400")),
             "jumptable_window": str(getattr(settings, "sanitize_jumptable_window", "0x800")),
+            "segment_gap_start": str(getattr(settings, "sanitize_segment_gap_start", "")) or "",
+            "segment_gap_end": str(getattr(settings, "sanitize_segment_gap_end", "")) or "",
+            "segment_gap_interval": str(getattr(settings, "sanitize_segment_gap_interval", "0x0")) or "0x0",
+            "segment_gap_history": list(getattr(settings, "sanitize_segment_gap_history", []) or []),
+            "segment_gap_interval_history": list(getattr(settings, "sanitize_segment_gap_interval_history", []) or []),
+            "segment_padding_start": str(getattr(settings, "sanitize_segment_padding_start", "")) or "",
+            "segment_padding_end": str(getattr(settings, "sanitize_segment_padding_end", "")) or "",
+            "segment_padding_interval": str(getattr(settings, "sanitize_segment_padding_interval", "0x0")) or "0x0",
+            "segment_padding_history": list(getattr(settings, "sanitize_segment_padding_history", []) or []),
+            "segment_padding_interval_history": list(
+                getattr(settings, "sanitize_segment_padding_interval_history", []) or []
+            ),
+            "icf_window_start": str(getattr(settings, "sanitize_icf_window_start", "")) or "",
+            "icf_window_end": str(getattr(settings, "sanitize_icf_window_end", "")) or "",
+            "icf_window_interval": str(getattr(settings, "sanitize_icf_window_interval", "0x0")) or "0x0",
+            "icf_window_history": list(getattr(settings, "sanitize_icf_window_history", []) or []),
+            "icf_window_interval_history": list(getattr(settings, "sanitize_icf_window_interval_history", []) or []),
+            "jumptable_window_start": str(getattr(settings, "sanitize_jumptable_window_start", "")) or "",
+            "jumptable_window_end": str(getattr(settings, "sanitize_jumptable_window_end", "")) or "",
+            "jumptable_window_interval": str(getattr(settings, "sanitize_jumptable_window_interval", "0x0")) or "0x0",
+            "jumptable_window_history": list(getattr(settings, "sanitize_jumptable_window_history", []) or []),
+            "jumptable_window_interval_history": list(
+                getattr(settings, "sanitize_jumptable_window_interval_history", []) or []
+            ),
+            "keep_only_one_per_nop_count": bool(getattr(settings, "sanitize_keep_only_one_per_nop_count", False)),
         }
         config_dialog = SanitizeConfigDialog(
             self,
@@ -10304,6 +11187,88 @@ class App(QMainWindow):
         settings.sanitize_segment_gap = f"0x{int(sanitize_options.segment_gap):x}"
         settings.sanitize_icf_window = f"0x{int(sanitize_options.icf_window):x}"
         settings.sanitize_jumptable_window = f"0x{int(sanitize_options.jumptable_window):x}"
+        try:
+            def _push(history: list[str], value: str, *, limit: int = 20) -> list[str]:
+                v = (value or "").strip()
+                if not v:
+                    return history
+                out: list[str] = [v]
+                for item in history:
+                    if not item:
+                        continue
+                    if str(item).strip().lower() == v.lower():
+                        continue
+                    out.append(str(item).strip())
+                    if len(out) >= limit:
+                        break
+                return out
+
+            settings.sanitize_segment_gap_start = (config_dialog.gap_start_combo.currentText() or "").strip()
+            settings.sanitize_segment_gap_end = (config_dialog.gap_end_combo.currentText() or "").strip()
+            settings.sanitize_segment_gap_interval = (config_dialog.gap_interval_combo.currentText() or "0x0").strip() or "0x0"
+            settings.sanitize_segment_gap_history = _push(
+                list(getattr(settings, "sanitize_segment_gap_history", []) or []),
+                settings.sanitize_segment_gap_start,
+            )
+            settings.sanitize_segment_gap_history = _push(settings.sanitize_segment_gap_history, settings.sanitize_segment_gap_end)
+            settings.sanitize_segment_gap_interval_history = _push(
+                list(getattr(settings, "sanitize_segment_gap_interval_history", []) or []),
+                settings.sanitize_segment_gap_interval,
+            )
+
+            settings.sanitize_segment_padding_start = (config_dialog.pad_start_combo.currentText() or "").strip()
+            settings.sanitize_segment_padding_end = (config_dialog.pad_end_combo.currentText() or "").strip()
+            settings.sanitize_segment_padding_interval = (
+                config_dialog.pad_interval_combo.currentText() or "0x0"
+            ).strip() or "0x0"
+            settings.sanitize_segment_padding_history = _push(
+                list(getattr(settings, "sanitize_segment_padding_history", []) or []),
+                settings.sanitize_segment_padding_start,
+            )
+            settings.sanitize_segment_padding_history = _push(
+                settings.sanitize_segment_padding_history, settings.sanitize_segment_padding_end
+            )
+            settings.sanitize_segment_padding_interval_history = _push(
+                list(getattr(settings, "sanitize_segment_padding_interval_history", []) or []),
+                settings.sanitize_segment_padding_interval,
+            )
+
+            settings.sanitize_icf_window_start = (config_dialog.icf_start_combo.currentText() or "").strip()
+            settings.sanitize_icf_window_end = (config_dialog.icf_end_combo.currentText() or "").strip()
+            settings.sanitize_icf_window_interval = (
+                config_dialog.icf_interval_combo.currentText() or "0x0"
+            ).strip() or "0x0"
+            settings.sanitize_icf_window_history = _push(
+                list(getattr(settings, "sanitize_icf_window_history", []) or []),
+                settings.sanitize_icf_window_start,
+            )
+            settings.sanitize_icf_window_history = _push(
+                settings.sanitize_icf_window_history, settings.sanitize_icf_window_end
+            )
+            settings.sanitize_icf_window_interval_history = _push(
+                list(getattr(settings, "sanitize_icf_window_interval_history", []) or []),
+                settings.sanitize_icf_window_interval,
+            )
+
+            settings.sanitize_jumptable_window_start = (config_dialog.jt_start_combo.currentText() or "").strip()
+            settings.sanitize_jumptable_window_end = (config_dialog.jt_end_combo.currentText() or "").strip()
+            settings.sanitize_jumptable_window_interval = (
+                config_dialog.jt_interval_combo.currentText() or "0x0"
+            ).strip() or "0x0"
+            settings.sanitize_jumptable_window_history = _push(
+                list(getattr(settings, "sanitize_jumptable_window_history", []) or []),
+                settings.sanitize_jumptable_window_start,
+            )
+            settings.sanitize_jumptable_window_history = _push(
+                settings.sanitize_jumptable_window_history, settings.sanitize_jumptable_window_end
+            )
+            settings.sanitize_jumptable_window_interval_history = _push(
+                list(getattr(settings, "sanitize_jumptable_window_interval_history", []) or []),
+                settings.sanitize_jumptable_window_interval,
+            )
+        except Exception:
+            pass
+        settings.sanitize_keep_only_one_per_nop_count = bool(getattr(sanitize_options, "keep_only_one_per_nop_count", False))
         self.config_manager.save(self.config)
         output_path = default_output_path
         if sanitize_options.output_name:
@@ -10355,11 +11320,12 @@ class App(QMainWindow):
                 self._refresh_entry_views(target.entry_id)
 
             def _on_finished(payload: object) -> None:
-                dialog.mark_finished("Sweep complete.")
                 summary = payload if isinstance(payload, dict) else {}
+                cancelled = bool(summary.get("cancelled", False))
+                dialog.mark_finished("Sweep cancelled." if cancelled else "Sweep complete.")
                 QMessageBox.information(
                     self,
-                    "Sweep complete",
+                    "Sweep cancelled" if cancelled else "Sweep complete",
                     f"Generated {int(summary.get('successes', 0) or 0)} binary(ies); {int(summary.get('failures', 0) or 0)} failed.",
                 )
                 self._cleanup_sweep_worker()
@@ -10368,6 +11334,7 @@ class App(QMainWindow):
             worker.finished.connect(_on_finished, Qt.QueuedConnection)
             thread.finished.connect(self._cleanup_sweep_worker)
             dialog.finished.connect(self._cleanup_sweep_worker)
+            dialog.stop_requested.connect(self._request_cancel_current_sweep, Qt.QueuedConnection)
             thread.started.connect(worker.run)
 
             self._current_sweep_thread = thread
@@ -10399,9 +11366,11 @@ class App(QMainWindow):
         worker.progress.connect(dialog.update_status)
         worker.progress.connect(self._append_console)
         worker.succeeded.connect(self._handle_sanitize_success)
+        worker.cancelled.connect(self._handle_sanitize_cancelled)
         worker.failed.connect(self._handle_sanitize_failure)
         thread.finished.connect(self._cleanup_sanitize_worker)
         dialog.finished.connect(self._cleanup_sanitize_worker)
+        dialog.stop_requested.connect(self._request_cancel_current_sanitization, Qt.QueuedConnection)
         thread.started.connect(worker.run)
 
         self._current_sanitize_thread = thread
@@ -10519,6 +11488,7 @@ class App(QMainWindow):
             return
         log_label = module_dialog.selected_log_label()
         unique_only = module_dialog.unique_only()
+        module_filters = module_dialog.selected_modules()
         log_path = str(self._project_log_path(run_label=log_label))
 
         self._last_unique_only = bool(unique_only)
@@ -10534,7 +11504,7 @@ class App(QMainWindow):
             parent_entry_id=entry.entry_id,
             sanitized_binary_path=str(path_obj),
             is_sanitized_run=True,
-            module_filters=parent_filters,
+            module_filters=module_filters,
             unique_only=unique_only,
             run_with_sudo=parent_sudo,
             metrics_options=run_options,
@@ -10586,7 +11556,11 @@ class App(QMainWindow):
         except Exception:
             parent_filters = []
 
-        options_dialog = RunSanitizedOptionsDialog(self, default_run_with_sudo=parent_sudo)
+        options_dialog = RunSanitizedOptionsDialog(
+            self,
+            default_run_with_sudo=parent_sudo,
+            force_assume_works=True,
+        )
         options_dialog.set_invocation_preview(
             args=parent_args,
             module_filters=parent_filters,
@@ -10675,7 +11649,7 @@ class App(QMainWindow):
         original_binary_path = str(item.get("original_binary_path") or "")
         entry = self._entry_by_id(entry_id)
         if entry is None:
-            QTimer.singleShot(0, self._run_next_sanitized_batch)
+            self._schedule_next_sanitized_batch()
             return
 
         # Reuse the parent entry invocation values (args/modules/sudo/pre-run) and only reuse the sanitized-run options dialog values.
@@ -10747,7 +11721,16 @@ class App(QMainWindow):
                 )
             except Exception:
                 pass
-            QTimer.singleShot(0, self._run_next_sanitized_batch)
+            self._schedule_next_sanitized_batch()
+
+    def _schedule_next_sanitized_batch(self) -> None:
+        if self._sanitized_batch_queue is None:
+            return
+        try:
+            delay_ms = int(getattr(self, "_sanitized_batch_inter_run_delay_ms", SANITIZED_BATCH_INTER_RUN_DELAY_MS_DEFAULT) or 0)
+        except Exception:
+            delay_ms = SANITIZED_BATCH_INTER_RUN_DELAY_MS_DEFAULT
+        QTimer.singleShot(max(0, delay_ms), self._run_next_sanitized_batch)
 
     def reveal_sanitized_binary(self) -> None:
         selection = self._selected_sanitized_output()
@@ -11265,10 +12248,24 @@ class App(QMainWindow):
         return True
 
     def _append_console(self, message: str) -> None:
+        # Thread-safe: emit to GUI thread when called from non-Qt threads.
+        try:
+            if QThread.currentThread() is self.thread():
+                self._append_console_on_gui(message)
+            else:
+                self.console_append_requested.emit(str(message))
+        except Exception:
+            pass
+
+    @Slot(str)
+    def _append_console_on_gui(self, message: str) -> None:
         if not hasattr(self, "console_output"):
             return
         timestamp = datetime.now().strftime("%H:%M:%S")
-        self.console_output.appendPlainText(f"[{timestamp}] {message}")
+        try:
+            self.console_output.appendPlainText(f"[{timestamp}] {message}")
+        except Exception:
+            pass
 
     def _discover_binary_modules(self, binary_path: str) -> list[str]:
         modules: list[str] = []
@@ -11394,17 +12391,21 @@ class App(QMainWindow):
         if entry:
             worker = self._current_sanitize_worker
             options = worker.options if worker is not None else None
-            self._add_sanitized_output(entry, result, options)
+            added = self._add_sanitized_output(entry, result, options)
+        else:
+            options = None
+            added = False
         self._refresh_entry_views(entry.entry_id if entry else None)
-        QMessageBox.information(
-            self,
-            "Sanitization complete",
-            (
-                "Generated sanitized binary at:\n"
-                f"{result.output_path}\n\n"
-                f"NOPed {result.nopped_instructions} instructions; preserved {result.preserved_instructions}."
-            ),
+        message = (
+            "Generated sanitized binary at:\n"
+            f"{result.output_path}\n\n"
+            f"NOPed {result.nopped_instructions} instructions; preserved {result.preserved_instructions}."
         )
+        if not added and options is not None and bool(getattr(options, "keep_only_one_per_nop_count", False)):
+            message += (
+                "\n\nNot added to the Generated Sanitized Binaries list because another sanitized binary already has the same NOP count."
+            )
+        QMessageBox.information(self, "Sanitization complete", message)
         self._cleanup_sanitize_worker()
 
     def _add_sanitized_output(
@@ -11412,7 +12413,21 @@ class App(QMainWindow):
         entry: RunEntry,
         result: SanitizationResult,
         options: SanitizeOptions | None,
-    ) -> None:
+    ) -> bool:
+        if options is not None and bool(getattr(options, "keep_only_one_per_nop_count", False)):
+            desired = int(getattr(result, "nopped_instructions", 0) or 0)
+            existing = list(getattr(entry, "sanitized_outputs", None) or [])
+            for out in existing:
+                try:
+                    existing_nops = int(getattr(out, "nopped_instructions", 0) or 0)
+                except Exception:
+                    continue
+                if existing_nops == desired:
+                    existing_path = str(getattr(out, "output_path", "") or "")
+                    self._append_console(
+                        f"Skipping listing for sanitized binary {result.output_path} (NOP count {desired:,}); already have {existing_path}."
+                    )
+                    return False
         output = SanitizedBinaryOutput(
             output_id=str(uuid.uuid4()),
             output_path=str(result.output_path),
@@ -11432,6 +12447,7 @@ class App(QMainWindow):
         entry.sanitized_preserved_instructions = int(output.preserved_instructions or 0)
         entry.sanitized_nopped_instructions = int(output.nopped_instructions or 0)
         self._persist_current_history()
+        return True
 
     def _cleanup_sweep_worker(self) -> None:
         thread = self._current_sweep_thread
@@ -11456,6 +12472,39 @@ class App(QMainWindow):
         self._append_console(f"Sanitization failed: {message}")
         QMessageBox.critical(self, "Sanitization failed", message)
         self._cleanup_sanitize_worker()
+
+    def _handle_sanitize_cancelled(self, message: str) -> None:
+        dialog = self._current_sanitize_dialog
+        if dialog:
+            dialog.append_output(str(message))
+            dialog.mark_finished("Sanitization cancelled.")
+        self._append_console(f"Sanitization cancelled: {message}")
+        QMessageBox.information(self, "Sanitization cancelled", str(message) or "Sanitization cancelled.")
+        self._cleanup_sanitize_worker()
+
+    def _request_cancel_current_sanitization(self) -> None:
+        worker = self._current_sanitize_worker
+        dialog = self._current_sanitize_dialog
+        if dialog:
+            dialog.append_output("Cancelling sanitization...")
+            dialog.update_status("Stopping...")
+        if worker is not None and hasattr(worker, "cancel"):
+            try:
+                worker.cancel()
+            except Exception:
+                pass
+
+    def _request_cancel_current_sweep(self) -> None:
+        worker = self._current_sweep_worker
+        dialog = self._current_sweep_dialog
+        if dialog:
+            dialog.append_output("Cancelling sweep...")
+            dialog.update_status("Stopping...")
+        if worker is not None and hasattr(worker, "cancel"):
+            try:
+                worker.cancel()
+            except Exception:
+                pass
 
     def _handle_build_worker_success(self) -> None:
         dialog = self._current_build_dialog
@@ -11602,6 +12651,34 @@ class App(QMainWindow):
                 pre_run_command=pre_run_command,
             )
         except Exception as exc:
+            # If sudo authentication fails, clear cache and re-prompt once.
+            try:
+                if run_with_sudo and self._password_error_requires_retry(str(exc) or ""):
+                    self._append_console("Sudo authentication failed; clearing cached password.")
+                    self._clear_cached_sudo_password()
+                    sudo_password = self._obtain_sudo_password(f"Enter sudo password to run {binary_label}:")
+                    if sudo_password:
+                        result_path = self.controller.run_binary(
+                            binary_path,
+                            log_path=log_path,
+                            module_filters=module_filters,
+                            unique_only=unique_only,
+                            use_sudo=True,
+                            sudo_password=sudo_password,
+                            extra_target_args=extra_args,
+                        )
+                        self._on_run_success(
+                            binary_path,
+                            str(result_path),
+                            run_label=run_label,
+                            target_args=extra_args,
+                            use_sudo=True,
+                            module_filters=module_filters,
+                            pre_run_command=pre_run_command,
+                        )
+                        return
+            except Exception:
+                pass
             self._on_run_failure(exc)
 
     def _run_with_progress(
@@ -11656,7 +12733,7 @@ class App(QMainWindow):
                 return False
 
         binary_label = Path(binary_path).name or binary_path
-        if not self._ensure_aslr_disabled_for_execution(binary_label, allow_prompt=not bool(batch_mode)):
+        if not self._ensure_aslr_disabled_for_execution(binary_label, allow_prompt=True):
             if batch_mode:
                 if dialog:
                     dialog.append_output("Skipping run: unable to disable ASLR.\n")
@@ -11761,6 +12838,9 @@ class App(QMainWindow):
             sudo_password=sudo_password,
             extra_target_args=final_args,
             pre_run_command=pre_run_command,
+            collect_cpu_metrics=bool(getattr(metrics_options, "collect_cpu_metrics", False)) if metrics_options else False,
+            collect_memory_metrics=bool(getattr(metrics_options, "collect_memory_metrics", False)) if metrics_options else False,
+            collect_timing_metrics=bool(getattr(metrics_options, "collect_timing_metrics", False)) if metrics_options else False,
         )
         thread = QThread(self)
         worker.moveToThread(thread)
@@ -11779,6 +12859,7 @@ class App(QMainWindow):
         self._current_run_dialog = dialog
         self._current_run_params = {
             "binary_path": binary_path,
+            "log_path": log_path,
             "record_entry": record_entry,
             "entry_to_refresh": entry_to_refresh,
             "run_label": run_label,
@@ -11791,10 +12872,12 @@ class App(QMainWindow):
             "target_args": final_args,
             "use_sudo": bool(run_with_sudo),
             "pre_run_command": pre_run_command,
+            "sudo_retry_attempted": False,
             "assume_works_entry_id": assume_works_entry_id,
             "assume_works_output_id": assume_works_output_id,
             "assume_works_after_ms": int(assume_works_after_ms) if assume_works_after_ms is not None else None,
             "assume_works_started_at": time.monotonic(),
+            "assume_works_started_at_epoch": time.time(),
             "suppress_failure_dialog": bool(suppress_failure_dialog),
             "batch_mode": bool(batch_mode),
         }
@@ -11835,9 +12918,16 @@ class App(QMainWindow):
                                         )
                                     break
                     finally:
-                        # Always stop the run after the threshold if it's still running.
-                        self._append_console(f"Assume-works threshold reached ({delay_ms}ms); terminating run.")
-                        self._request_terminate_current_run(reason="assume_works")
+                        # Batch mode needs to progress; single-run mode should not auto-terminate.
+                        if batch_mode:
+                            self._append_console(
+                                f"Assume-works threshold reached ({delay_ms}ms); terminating run (batch mode)."
+                            )
+                            self._request_terminate_current_run(reason="assume_works")
+                        else:
+                            self._append_console(
+                                f"Assume-works threshold reached ({delay_ms}ms); leaving run active."
+                            )
 
                 timer.timeout.connect(_mark_if_still_running)
                 timer.start(delay_ms)
@@ -11873,9 +12963,13 @@ class App(QMainWindow):
     def _stop_logging_async(self) -> None:
         def _stop() -> None:
             try:
-                self.controller.stop_logging()
+                worker = getattr(self, "_current_run_worker", None)
+                if worker is not None and hasattr(worker, "request_stop"):
+                    worker.request_stop()
+                else:
+                    self.controller.stop_logging()
             except Exception as exc:  # pragma: no cover - defensive stop
-                QTimer.singleShot(0, lambda: self._append_console(f"Unable to stop run: {exc}"))
+                self._append_console(f"Unable to stop run: {exc}")
 
         threading.Thread(target=_stop, daemon=True).start()
 
@@ -11899,8 +12993,103 @@ class App(QMainWindow):
         self._append_console(console_msg)
         if self._current_run_dialog:
             self._current_run_dialog.append_output(dialog_msg)
+
+        # Sanitized targets may daemonize and detach from the original process group.
+        # On user stop, attempt best-effort cleanup of any lingering processes that
+        # match the sanitized executable path and started after the run began.
+        try:
+            params = self._current_run_params or {}
+            if bool(params.get("is_sanitized_run", False)) and params.get("binary_path") and self._run_stop_reason == "user":
+                started_at_epoch = params.get("assume_works_started_at_epoch")
+                if started_at_epoch:
+                    self._terminate_lingering_exe_processes_with_sudo_fallback_async(
+                        str(params.get("binary_path")),
+                        float(started_at_epoch),
+                        use_sudo=bool(params.get("use_sudo", False)),
+                    )
+        except Exception:
+            pass
         # stop_logging can block (wait/kill escalation). Never run it on the GUI thread.
         self._stop_logging_async()
+
+    def _terminate_lingering_exe_processes_with_sudo_fallback_async(
+        self,
+        exe_path: str,
+        started_after_epoch: float,
+        *,
+        use_sudo: bool,
+    ) -> None:
+        def _kill() -> None:
+            try:
+                self._terminate_lingering_exe_processes_with_sudo_fallback(
+                    exe_path,
+                    started_after_epoch,
+                    use_sudo=use_sudo,
+                )
+            except Exception:
+                pass
+
+        threading.Thread(target=_kill, daemon=True).start()
+
+    def _terminate_lingering_exe_processes_with_sudo_fallback(
+        self,
+        exe_path: str,
+        started_after_epoch: float,
+        *,
+        use_sudo: bool,
+    ) -> None:
+        # First try the normal (non-sudo) psutil-based cleanup.
+        self._terminate_lingering_exe_processes(exe_path, started_after_epoch)
+
+        if not use_sudo:
+            return
+
+        # If the run used sudo, lingering processes may be root-owned and invisible to psutil.
+        # Fall back to `sudo pkill -f -- <resolved_exe_path>`.
+        try:
+            resolved = str(Path(exe_path).resolve())
+        except Exception:
+            resolved = str(exe_path)
+        try:
+            pattern = re.escape(resolved)
+        except Exception:
+            pattern = resolved
+
+        prompt = "Enter sudo password to stop the running sanitized binary:"
+        password = self._obtain_sudo_password(prompt)
+        if not password:
+            return
+
+        def _run_pkill(sig: str) -> tuple[int, str, str]:
+            cmd = ["sudo", "-S", "-p", "", "pkill", f"-{sig}", "-f", "--", pattern]
+            completed = subprocess.run(
+                cmd,
+                input=password + "\n",
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            return int(completed.returncode), str(completed.stdout or ""), str(completed.stderr or "")
+
+        for sig in ("TERM", "KILL"):
+            code, stdout, stderr = _run_pkill(sig)
+            combined = f"{stdout}\n{stderr}".strip()
+            lowered = combined.lower()
+            if self._password_error_requires_retry(lowered):
+                self._clear_cached_sudo_password()
+                password = self._obtain_sudo_password(prompt)
+                if not password:
+                    return
+                code, stdout, stderr = _run_pkill(sig)
+                combined = f"{stdout}\n{stderr}".strip()
+                lowered = combined.lower()
+
+            # pkill returns 0 if any process matched, 1 if none matched.
+            if code == 0:
+                self._append_console(f"Stopped lingering process(es) for {resolved} (sudo pkill -{sig}).")
+                return
+            if "no process found" in lowered:
+                return
 
     def _handle_run_worker_success(self, log_path: str) -> None:
         params = self._current_run_params or {}
@@ -11917,6 +13106,14 @@ class App(QMainWindow):
         pre_run_command = params.get("pre_run_command")
         metrics_options: RunSanitizedOptions | None = params.get("metrics_options")
         dialog = self._current_run_dialog
+
+        worker = self._current_run_worker
+        run_metrics: dict[str, object] | None = getattr(worker, "metrics", None) if worker is not None else None
+        if metrics_options and run_metrics:
+            summary = _format_run_metrics(run_metrics)
+            self._append_console(f"Run metrics: {summary}")
+            if dialog is not None:
+                dialog.append_output(f"Run metrics: {summary}")
         if dialog and not bool(params.get("batch_mode", False)):
             dialog.append_output("Run completed successfully.")
             dialog.mark_finished(True)
@@ -11933,7 +13130,7 @@ class App(QMainWindow):
         if bool(params.get("batch_mode", False)) and binary_path:
             try:
                 if self._run_stop_requested and stop_reason == "assume_works":
-                    outcome = "ASSUME_WORKS_TERMINATED"
+                    outcome = "ASSUMED_WORKING"
                 elif self._run_stop_requested:
                     outcome = "STOPPED"
                 else:
@@ -11951,6 +13148,7 @@ class App(QMainWindow):
                 assume_output_id = params.get("assume_works_output_id")
                 assume_after_ms = params.get("assume_works_after_ms")
                 started_at = params.get("assume_works_started_at")
+                started_at_epoch = params.get("assume_works_started_at_epoch")
                 if assume_entry_id and assume_output_id and assume_after_ms and started_at:
                     elapsed_ms = int(max(0.0, (time.monotonic() - float(started_at)) * 1000.0))
                     threshold_ms = max(1, min(10000, int(assume_after_ms)))
@@ -11959,6 +13157,21 @@ class App(QMainWindow):
                         if entry is not None:
                             for out in list(getattr(entry, "sanitized_outputs", None) or []):
                                 if getattr(out, "output_id", None) == assume_output_id:
+                                    # Batch runs may daemonize (parent exits quickly) while the service keeps running.
+                                    # In that case, treat the output as working.
+                                    if bool(params.get("batch_mode", False)) and binary_path and started_at_epoch:
+                                        try:
+                                            if self._has_running_exe_process(str(binary_path), float(started_at_epoch)):
+                                                if getattr(out, "works", None) is not True:
+                                                    out.works = True
+                                                    self._persist_current_history()
+                                                    self._refresh_entry_views(entry.entry_id)
+                                                    self._append_console(
+                                                        f"Set Works=True (daemon still running after exit; <{threshold_ms}ms)."
+                                                    )
+                                                break
+                                        except Exception:
+                                            pass
                                     if getattr(out, "works", None) is not False:
                                         out.works = False
                                         self._persist_current_history()
@@ -11967,6 +13180,15 @@ class App(QMainWindow):
                                             f"Set Works=False (exited before {threshold_ms}ms)."
                                         )
                                     break
+        except Exception:
+            pass
+
+        # Batch sanitized runs should not leave daemonized services running between variants.
+        try:
+            if bool(params.get("batch_mode", False)) and bool(is_sanitized_run) and binary_path:
+                started_at_epoch = params.get("assume_works_started_at_epoch")
+                if started_at_epoch:
+                    self._terminate_lingering_exe_processes_async(str(binary_path), float(started_at_epoch))
         except Exception:
             pass
         if binary_path:
@@ -11982,17 +13204,9 @@ class App(QMainWindow):
                 use_sudo=use_sudo,
                 module_filters=params.get("module_filters"),
                 pre_run_command=pre_run_command,
+                run_metrics=run_metrics,
             )
-        if metrics_options and any(
-            [
-                metrics_options.collect_cpu_metrics,
-                metrics_options.collect_memory_metrics,
-                metrics_options.collect_timing_metrics,
-            ]
-        ):
-            self._append_console(
-                "Metric collection was requested for this run. (Detailed capture hooks not implemented yet.)"
-            )
+        # Metrics collection is best-effort and reported above when available.
         if entry_to_refresh:
             entry_to_refresh.log_path = log_path
             self._refresh_entry_views(entry_to_refresh.entry_id)
@@ -12010,6 +13224,65 @@ class App(QMainWindow):
         params = self._current_run_params or {}
         stop_reason = getattr(self, "_run_stop_reason", None)
         binary_path = params.get("binary_path")
+
+        # If sudo authentication fails, clear the cached password and allow a re-prompt/retry.
+        try:
+            is_sudo = bool(params.get("use_sudo", False))
+            is_batch = bool(params.get("batch_mode", False))
+            already_retried = bool(params.get("sudo_retry_attempted", False))
+            if (
+                not self._run_stop_requested
+                and is_sudo
+                and self._password_error_requires_retry(error_message or "")
+            ):
+                self._append_console("Sudo authentication failed; clearing cached password.")
+                self._clear_cached_sudo_password()
+
+                if is_batch:
+                    # Batch mode cannot prompt mid-run; leave failure handling below.
+                    pass
+                elif not already_retried and binary_path:
+                    binary_label = Path(str(binary_path)).name or str(binary_path)
+                    prompt = f"Enter sudo password to run {binary_label}:"
+                    password = self._obtain_sudo_password(prompt)
+                    if password:
+                        if dialog:
+                            dialog.append_output("Sudo authentication failed. Retrying with a new password...")
+                            dialog.set_running_label(binary_label)
+                        params["sudo_retry_attempted"] = True
+                        # Re-run with the same dialog, non-blocking.
+                        self._cleanup_run_worker()
+                        self._run_with_progress(
+                            str(binary_path),
+                            params.get("log_path"),
+                            record_entry=bool(params.get("record_entry", True)),
+                            entry_to_refresh=params.get("entry_to_refresh"),
+                            dialog_label=binary_label,
+                            run_label=params.get("run_label"),
+                            parent_entry_id=params.get("parent_entry_id"),
+                            sanitized_binary_path=params.get("sanitized_binary_path"),
+                            is_sanitized_run=bool(params.get("is_sanitized_run", False)),
+                            module_filters=params.get("module_filters"),
+                            unique_only=bool(params.get("unique_only", False)),
+                            run_with_sudo=True,
+                            metrics_options=params.get("metrics_options"),
+                            pre_run_command=params.get("pre_run_command"),
+                            target_args=params.get("target_args"),
+                            original_binary_path=params.get("original_binary_path"),
+                            copy_binary_to_relative_path=bool(params.get("copy_binary_to_relative_path", False)),
+                            copy_sanitized_to_original_path=bool(params.get("copy_sanitized_to_original_path", False)),
+                            assume_works_entry_id=params.get("assume_works_entry_id"),
+                            assume_works_output_id=params.get("assume_works_output_id"),
+                            assume_works_after_ms=params.get("assume_works_after_ms"),
+                            block=False,
+                            dialog=dialog,
+                            suppress_failure_dialog=bool(params.get("suppress_failure_dialog", False)),
+                            batch_mode=False,
+                        )
+                        return
+        except Exception:
+            # Never let retry logic break normal failure handling.
+            pass
         if dialog:
             if self._run_stop_requested and stop_reason == "assume_works":
                 dialog.append_output("Run terminated after assume-works threshold.")
@@ -12045,6 +13318,7 @@ class App(QMainWindow):
                 assume_output_id = params.get("assume_works_output_id")
                 assume_after_ms = params.get("assume_works_after_ms")
                 started_at = params.get("assume_works_started_at")
+                started_at_epoch = params.get("assume_works_started_at_epoch")
                 if assume_entry_id and assume_output_id and assume_after_ms and started_at:
                     elapsed_ms = int(max(0.0, (time.monotonic() - float(started_at)) * 1000.0))
                     threshold_ms = max(1, min(10000, int(assume_after_ms)))
@@ -12053,6 +13327,19 @@ class App(QMainWindow):
                         if entry is not None:
                             for out in list(getattr(entry, "sanitized_outputs", None) or []):
                                 if getattr(out, "output_id", None) == assume_output_id:
+                                    if bool(params.get("batch_mode", False)) and binary_path and started_at_epoch:
+                                        try:
+                                            if self._has_running_exe_process(str(binary_path), float(started_at_epoch)):
+                                                if getattr(out, "works", None) is not True:
+                                                    out.works = True
+                                                    self._persist_current_history()
+                                                    self._refresh_entry_views(entry.entry_id)
+                                                    self._append_console(
+                                                        f"Set Works=True (daemon still running after failure; <{threshold_ms}ms)."
+                                                    )
+                                                break
+                                        except Exception:
+                                            pass
                                     if getattr(out, "works", None) is not False:
                                         out.works = False
                                         self._persist_current_history()
@@ -12063,13 +13350,22 @@ class App(QMainWindow):
                                     break
         except Exception:
             pass
+
+        # Batch sanitized runs should not leave daemonized services running between variants.
+        try:
+            if bool(params.get("batch_mode", False)) and bool(params.get("is_sanitized_run", False)) and binary_path:
+                started_at_epoch = params.get("assume_works_started_at_epoch")
+                if started_at_epoch:
+                    self._terminate_lingering_exe_processes_async(str(binary_path), float(started_at_epoch))
+        except Exception:
+            pass
         if bool(params.get("batch_mode", False)):
             # Schedule continuation only after the worker thread has finished and cleanup runs.
             self._batch_continue_pending = True
             if binary_path:
                 try:
                     if self._run_stop_requested and stop_reason == "assume_works":
-                        outcome = "ASSUME_WORKS_TERMINATED"
+                        outcome = "ASSUMED_WORKING"
                     elif self._run_stop_requested:
                         outcome = "STOPPED"
                     else:
@@ -12082,6 +13378,29 @@ class App(QMainWindow):
             self._run_stop_requested = False
             self._run_stop_reason = None
             return
+
+        # Persist any collected metrics even if the run fails/stops so the metrics viewer
+        # can show data for daemonizing/crashing services.
+        try:
+            if binary_path and bool(params.get("record_entry", True)):
+                worker = self._current_run_worker
+                run_metrics = getattr(worker, "metrics", None) if worker is not None else None
+                if isinstance(run_metrics, dict) and run_metrics:
+                    self._record_run_entry(
+                        str(binary_path),
+                        params.get("log_path"),
+                        run_label=params.get("run_label"),
+                        parent_entry_id=params.get("parent_entry_id"),
+                        sanitized_binary_path=params.get("sanitized_binary_path"),
+                        is_sanitized_run=bool(params.get("is_sanitized_run", False)),
+                        target_args=params.get("target_args"),
+                        use_sudo=bool(params.get("use_sudo", False)),
+                        module_filters=params.get("module_filters"),
+                        pre_run_command=params.get("pre_run_command"),
+                        run_metrics=run_metrics,
+                    )
+        except Exception:
+            pass
 
         self._run_stop_requested = False
         self._run_stop_reason = None
@@ -12141,7 +13460,93 @@ class App(QMainWindow):
         if self._batch_continue_pending:
             self._batch_continue_pending = False
             if self._sanitized_batch_queue is not None:
-                QTimer.singleShot(0, self._run_next_sanitized_batch)
+                self._schedule_next_sanitized_batch()
+
+    def _has_running_exe_process(self, exe_path: str, started_after_epoch: float) -> bool:
+        """Return True if a process exists whose resolved exe matches exe_path.
+
+        Used to detect daemonizing targets (nginx) that may keep running after the parent exits.
+        """
+        try:
+            import psutil  # type: ignore
+        except Exception:
+            return False
+
+        want = str(Path(exe_path).resolve())
+        threshold = float(started_after_epoch or 0.0)
+        for proc in psutil.process_iter(attrs=["pid", "exe", "create_time"]):
+            try:
+                info = proc.info or {}
+                exe = info.get("exe")
+                if not exe:
+                    continue
+                if str(Path(str(exe)).resolve()) != want:
+                    continue
+                created = float(info.get("create_time") or 0.0)
+                if created and created + 0.001 < threshold:
+                    continue
+                if proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE:
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _terminate_lingering_exe_processes_async(self, exe_path: str, started_after_epoch: float) -> None:
+        def _kill() -> None:
+            try:
+                self._terminate_lingering_exe_processes(exe_path, started_after_epoch)
+            except Exception:
+                pass
+
+        threading.Thread(target=_kill, daemon=True).start()
+
+    def _terminate_lingering_exe_processes(self, exe_path: str, started_after_epoch: float) -> None:
+        """Best-effort termination of processes whose exe matches exe_path.
+
+        Restricted to exact exe match + created after the run started to avoid killing unrelated
+        system services.
+        """
+        try:
+            import psutil  # type: ignore
+        except Exception:
+            return
+
+        want = str(Path(exe_path).resolve())
+        threshold = float(started_after_epoch or 0.0)
+        victims: list[object] = []
+        for proc in psutil.process_iter(attrs=["pid", "exe", "create_time"]):
+            try:
+                info = proc.info or {}
+                exe = info.get("exe")
+                if not exe:
+                    continue
+                if str(Path(str(exe)).resolve()) != want:
+                    continue
+                created = float(info.get("create_time") or 0.0)
+                if created and created + 0.001 < threshold:
+                    continue
+                if proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE:
+                    victims.append(proc)
+            except Exception:
+                continue
+
+        if not victims:
+            return
+        self._append_console(f"Cleaning up {len(victims)} lingering process(es) for {want}.")
+        for proc in victims:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        try:
+            gone, alive = psutil.wait_procs(victims, timeout=2.0)
+        except Exception:
+            gone, alive = [], victims
+        for proc in alive:
+            try:
+                proc.kill()
+            except Exception:
+                pass
 
     def _setup_batch_output_buffer(self, dialog: RunProgressDialog) -> None:
         # Reset per-run buffer.
@@ -12209,6 +13614,7 @@ class App(QMainWindow):
         use_sudo: bool = False,
         module_filters: list[str] | None = None,
         pre_run_command: str | None = None,
+        run_metrics: dict[str, object] | None = None,
     ) -> None:
         binary_name = Path(binary_path).name or binary_path
         self._append_console(
@@ -12226,6 +13632,7 @@ class App(QMainWindow):
                 use_sudo=use_sudo,
                 module_filters=module_filters,
                 pre_run_command=pre_run_command,
+                run_metrics=run_metrics,
             )
 
     def _on_run_failure(self, error: Exception | str) -> None:

@@ -18,6 +18,12 @@ class PreviewCancelled(Exception):
     pass
 
 
+class SanitizationCancelled(Exception):
+    """Raised when sanitization is cancelled mid-way."""
+
+    pass
+
+
 @dataclass
 class SanitizationResult:
     total_instructions: int
@@ -50,6 +56,7 @@ class BinarySanitizer:
         binary: lief.Binary | None = None,
         preserve_trampolines: bool = True,
         protected_ranges: list[tuple[int, int]] | None = None,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> SanitizationResult:
         if not binary_path.exists():
             raise FileNotFoundError(f"Binary not found: {binary_path}")
@@ -79,12 +86,16 @@ class BinarySanitizer:
         normalized_ranges = self._normalize_ranges(protected_ranges)
 
         for section in sections:
+            if should_cancel and should_cancel():
+                raise SanitizationCancelled("Sanitization cancelled.")
             if self._should_skip_section(section, preserve_trampolines):
                 continue
             data = bytes(section.content)
             if not data:
                 continue
             for instruction in md.disasm(data, section.virtual_address):
+                if should_cancel and should_cancel():
+                    raise SanitizationCancelled("Sanitization cancelled.")
                 total += 1
                 address = int(instruction.address)
                 if address in executed_addresses:

@@ -69,3 +69,29 @@ def test_history_store_defaults_missing_works_to_none(tmp_path):
     assert len(loaded) == 1
     assert len(loaded[0].sanitized_outputs) == 1
     assert loaded[0].sanitized_outputs[0].works is None
+
+
+def test_history_store_round_trips_run_metrics(tmp_path):
+    store = HistoryStore(path=tmp_path / "history.json")
+    project = "p"
+
+    entry = RunEntry(
+        entry_id="e1",
+        name="run",
+        binary_path="/bin/true",
+        log_path="/tmp/log.txt",
+        timestamp=datetime(2026, 1, 1, 0, 0, 0),
+        run_metrics={
+            "wall_time_ms": 123,
+            "cpu_user_s": 0.25,
+            "cpu_system_s": 0.1,
+            "peak_rss_bytes": 1024,
+        },
+    )
+
+    store.save_project(project, [entry])
+    loaded = store.load_project(project)
+    assert len(loaded) == 1
+    assert loaded[0].run_metrics is not None
+    assert loaded[0].run_metrics.get("wall_time_ms") == 123
+    assert loaded[0].run_metrics.get("peak_rss_bytes") == 1024

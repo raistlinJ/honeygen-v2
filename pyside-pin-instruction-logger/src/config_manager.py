@@ -37,6 +37,32 @@ class ProjectConfig:
     sanitize_icf_window: str = "0x400"
     sanitize_jumptable_window: str = "0x800"
 
+    # Advanced knob range persistence (start/end/interval) and history for dropdowns.
+    sanitize_segment_gap_start: str = "0x200000"
+    sanitize_segment_gap_end: str = "0x200000"
+    sanitize_segment_gap_interval: str = "0x0"
+    sanitize_segment_gap_history: list[str] = field(default_factory=list)
+    sanitize_segment_gap_interval_history: list[str] = field(default_factory=list)
+
+    sanitize_segment_padding_start: str = "0x2000"
+    sanitize_segment_padding_end: str = "0x2000"
+    sanitize_segment_padding_interval: str = "0x0"
+    sanitize_segment_padding_history: list[str] = field(default_factory=list)
+    sanitize_segment_padding_interval_history: list[str] = field(default_factory=list)
+
+    sanitize_icf_window_start: str = "0x400"
+    sanitize_icf_window_end: str = "0x400"
+    sanitize_icf_window_interval: str = "0x0"
+    sanitize_icf_window_history: list[str] = field(default_factory=list)
+    sanitize_icf_window_interval_history: list[str] = field(default_factory=list)
+
+    sanitize_jumptable_window_start: str = "0x800"
+    sanitize_jumptable_window_end: str = "0x800"
+    sanitize_jumptable_window_interval: str = "0x0"
+    sanitize_jumptable_window_history: list[str] = field(default_factory=list)
+    sanitize_jumptable_window_interval_history: list[str] = field(default_factory=list)
+    sanitize_keep_only_one_per_nop_count: bool = False
+
 
 @dataclass
 class AppConfig:

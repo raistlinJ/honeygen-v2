@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+from typing import Any
+
 from models.sanitized_output import SanitizedBinaryOutput
 
 
@@ -37,6 +39,9 @@ class RunEntry:
     module_filters: list[str] | None = None
     # Optional pre-run setup command or script path
     pre_run_command: str | None = None
+
+    # Optional runtime metrics collected during execution (best-effort).
+    run_metrics: dict[str, Any] | None = None
 
     def label(self) -> str:
         prefix = "[SAN] " if self.is_sanitized_run else ""
