@@ -390,6 +390,12 @@ class RunProgressDialog(QDialog):
         self._stop_callback()
 
 
+class BatchRunResult(NamedTuple):
+    binary_path: str
+    outcome: str
+    log_path: str | None
+
+
 class ModuleSelectionDialog(QDialog):
     def __init__(
         self,
@@ -5075,6 +5081,7 @@ class App(QMainWindow):
         self._sanitized_batch_cancelled = False
         self._sanitized_batch_total = 0
         self._sanitized_batch_completed = 0
+        self._sanitized_batch_results: list[BatchRunResult] = []
         self._current_batch_output_timer: QTimer | None = None
         self._current_batch_output_buffer: deque[str] = deque()
         self._current_batch_output_dropped = 0
@@ -10623,9 +10630,17 @@ class App(QMainWindow):
         self._sanitized_batch_cancelled = False
         self._sanitized_batch_total = len(queue)
         self._sanitized_batch_completed = 0
+        self._sanitized_batch_results = []
 
         dialog = RunProgressDialog(self, f"Sanitized Batch ({len(queue)} run(s))", on_stop=self._request_stop_current_run)
         dialog.setWindowTitle("Executing Sanitized Binaries")
+        # Make batch dialog twice as wide for readability.
+        try:
+            hint = dialog.sizeHint()
+            if hint is not None and int(hint.width()) > 0:
+                dialog.resize(int(hint.width()) * 2, max(int(hint.height()), 200))
+        except Exception:
+            pass
         dialog.append_output(f"Starting batch: {len(queue)} sanitized binary(ies).")
         dialog.show()
         dialog.raise_()
@@ -10638,12 +10653,18 @@ class App(QMainWindow):
             dialog = self._sanitized_batch_dialog
             if dialog is not None:
                 dialog.append_output("Batch complete." if not self._sanitized_batch_cancelled else "Batch cancelled.")
+                if self._sanitized_batch_results:
+                    dialog.append_output("\nBatch summary:\n")
+                    for result in self._sanitized_batch_results:
+                        suffix = f" -> {result.log_path}" if result.log_path else ""
+                        dialog.append_output(f"- {result.outcome}: {result.binary_path}{suffix}\n")
                 dialog.mark_finished(not self._sanitized_batch_cancelled)
             self._sanitized_batch_queue = None
             self._sanitized_batch_options = None
             self._sanitized_batch_dialog = None
             self._sanitized_batch_total = 0
             self._sanitized_batch_completed = 0
+            self._sanitized_batch_results = []
             self._update_sanitized_action_state()
             return
 
@@ -10720,6 +10741,12 @@ class App(QMainWindow):
             # Always continue to avoid stalling the batch.
             if dialog is not None:
                 dialog.append_output(f"[{batch_index}/{batch_total}] Skipping: unable to start run.\n")
+            try:
+                self._sanitized_batch_results.append(
+                    BatchRunResult(binary_path=binary_path, outcome="SKIPPED", log_path=None)
+                )
+            except Exception:
+                pass
             QTimer.singleShot(0, self._run_next_sanitized_batch)
 
     def reveal_sanitized_binary(self) -> None:
@@ -11878,6 +11905,7 @@ class App(QMainWindow):
     def _handle_run_worker_success(self, log_path: str) -> None:
         params = self._current_run_params or {}
         binary_path = params.get("binary_path")
+        stop_reason = getattr(self, "_run_stop_reason", None)
         record_entry = params.get("record_entry", True)
         entry_to_refresh = params.get("entry_to_refresh")
         run_label = params.get("run_label")
@@ -11899,6 +11927,20 @@ class App(QMainWindow):
             # Flush any buffered output so the last lines are visible.
             try:
                 self._flush_batch_output(dialog)
+            except Exception:
+                pass
+
+        if bool(params.get("batch_mode", False)) and binary_path:
+            try:
+                if self._run_stop_requested and stop_reason == "assume_works":
+                    outcome = "ASSUME_WORKS_TERMINATED"
+                elif self._run_stop_requested:
+                    outcome = "STOPPED"
+                else:
+                    outcome = "OK"
+                self._sanitized_batch_results.append(
+                    BatchRunResult(binary_path=str(binary_path), outcome=outcome, log_path=str(log_path))
+                )
             except Exception:
                 pass
 
@@ -11967,6 +12009,7 @@ class App(QMainWindow):
         dialog = self._current_run_dialog
         params = self._current_run_params or {}
         stop_reason = getattr(self, "_run_stop_reason", None)
+        binary_path = params.get("binary_path")
         if dialog:
             if self._run_stop_requested and stop_reason == "assume_works":
                 dialog.append_output("Run terminated after assume-works threshold.")
@@ -12020,14 +12063,28 @@ class App(QMainWindow):
                                     break
         except Exception:
             pass
-        self._run_stop_requested = False
-        self._run_stop_reason = None
         if bool(params.get("batch_mode", False)):
             # Schedule continuation only after the worker thread has finished and cleanup runs.
             self._batch_continue_pending = True
+            if binary_path:
+                try:
+                    if self._run_stop_requested and stop_reason == "assume_works":
+                        outcome = "ASSUME_WORKS_TERMINATED"
+                    elif self._run_stop_requested:
+                        outcome = "STOPPED"
+                    else:
+                        outcome = "FAILED"
+                    self._sanitized_batch_results.append(
+                        BatchRunResult(binary_path=str(binary_path), outcome=outcome, log_path=None)
+                    )
+                except Exception:
+                    pass
+            self._run_stop_requested = False
+            self._run_stop_reason = None
             return
 
         self._run_stop_requested = False
+        self._run_stop_reason = None
         self._cleanup_run_worker()
 
     def _cleanup_run_worker(self) -> None:

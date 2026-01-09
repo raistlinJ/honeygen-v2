@@ -105,3 +105,36 @@ def test_batch_advances_after_success(qtbot, tmp_path, monkeypatch):
     assert started is True
 
     qtbot.waitUntil(lambda: next_called["value"], timeout=5000)
+
+
+@pytest.mark.qt_no_exception_capture
+def test_batch_prints_summary_on_completion(qtbot, tmp_path, monkeypatch):
+    app = _make_isolated_app(qtbot, tmp_path, monkeypatch)
+
+    class _DummyDialog:
+        def __init__(self) -> None:
+            self.outputs: list[str] = []
+            self.finished: bool | None = None
+
+        def append_output(self, text: str) -> None:
+            self.outputs.append(str(text))
+
+        def mark_finished(self, success: bool) -> None:
+            self.finished = bool(success)
+
+    dummy = _DummyDialog()
+    app._sanitized_batch_dialog = dummy  # type: ignore[assignment]
+    app._sanitized_batch_cancelled = False
+    app._sanitized_batch_queue = []
+    app._sanitized_batch_results = [
+        app_module.BatchRunResult(binary_path="/tmp/a", outcome="OK", log_path="/tmp/a.log"),
+        app_module.BatchRunResult(binary_path="/tmp/b", outcome="FAILED", log_path=None),
+    ]
+
+    app._run_next_sanitized_batch()
+
+    combined = "".join(dummy.outputs)
+    assert "Batch summary" in combined
+    assert "- OK: /tmp/a -> /tmp/a.log" in combined
+    assert "- FAILED: /tmp/b" in combined
+    assert dummy.finished is True
