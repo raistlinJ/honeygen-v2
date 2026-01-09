@@ -59,3 +59,49 @@ def test_user_stop_cancels_batch(qtbot, tmp_path, monkeypatch):
     assert app._run_stop_reason == "user"
     assert app._sanitized_batch_cancelled is True
     assert app._sanitized_batch_queue == []
+
+
+@pytest.mark.qt_no_exception_capture
+def test_batch_advances_after_success(qtbot, tmp_path, monkeypatch):
+    app = _make_isolated_app(qtbot, tmp_path, monkeypatch)
+
+    # Force allow running without interactive prompts.
+    monkeypatch.setattr(app, "_ensure_aslr_disabled_for_execution", lambda *a, **k: True)
+
+    # Fake a still-active batch so cleanup will schedule the next item.
+    app._sanitized_batch_queue = [{"entry_id": "e1", "output_id": "o1", "binary_path": "/bin/true"}]
+    app._sanitized_batch_cancelled = False
+
+    next_called = {"value": False}
+
+    def _next() -> None:
+        next_called["value"] = True
+
+    monkeypatch.setattr(app, "_run_next_sanitized_batch", _next)
+
+    def _fake_run_binary(*args, **kwargs):
+        on_output = kwargs.get("on_output")
+        if callable(on_output):
+            on_output("hello\n")
+        return tmp_path / "log.txt"
+
+    monkeypatch.setattr(app.controller, "run_binary", _fake_run_binary)
+
+    dialog = app_module.RunProgressDialog(app, "batch-test", on_stop=None)
+    qtbot.addWidget(dialog)
+
+    started = app._run_with_progress(
+        "/bin/true",
+        str(tmp_path / "log.txt"),
+        record_entry=False,
+        dialog_label="batch-test",
+        is_sanitized_run=True,
+        run_with_sudo=False,
+        block=False,
+        dialog=dialog,
+        suppress_failure_dialog=True,
+        batch_mode=True,
+    )
+    assert started is True
+
+    qtbot.waitUntil(lambda: next_called["value"], timeout=5000)

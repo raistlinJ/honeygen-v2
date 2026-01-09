@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import threading
 import time
 import shutil
 import string
@@ -10543,12 +10544,12 @@ class App(QMainWindow):
 
     def _execute_sanitized_binaries_batch(self, selections: list[tuple[RunEntry, SanitizedBinaryOutput]]) -> None:
         if self._current_run_thread and self._current_run_thread.isRunning():
-            QMessageBox.information(self, "Run in progress", "Please wait for the current run to finish.")
+            self._append_console("Unable to start sanitized batch: a run is already in progress.")
             return
         if not selections:
             return
         if self._sanitized_batch_queue:
-            QMessageBox.information(self, "Batch in progress", "Please wait for the current batch to finish.")
+            self._append_console("Unable to start sanitized batch: another batch is already in progress.")
             return
 
         first_entry, _ = selections[0]
@@ -10590,10 +10591,8 @@ class App(QMainWindow):
             return
         run_options = options_dialog.selected_options()
         if not run_options.run_with_pin:
-            QMessageBox.information(
-                self,
-                "PIN execution required",
-                "Sanitized runs currently depend on the PIN tracer. Continuing with PIN instrumentation enabled.",
+            self._append_console(
+                "Sanitized runs currently depend on the PIN tracer; continuing with PIN instrumentation enabled."
             )
 
         queue: list[dict[str, object]] = []
@@ -10616,7 +10615,7 @@ class App(QMainWindow):
         if missing:
             self._append_console(f"Skipping {len(missing)} missing sanitized binary(ies).")
         if not queue:
-            QMessageBox.information(self, "Nothing to execute", "No selected sanitized binaries exist on disk.")
+            self._append_console("Nothing to execute: no selected sanitized binaries exist on disk.")
             return
 
         self._sanitized_batch_queue = queue
@@ -10687,7 +10686,7 @@ class App(QMainWindow):
             dialog.append_output(f"\n[{batch_index}/{batch_total}] Running: {binary_path}")
 
         run_options = self._sanitized_batch_options
-        self._run_with_progress(
+        started = self._run_with_progress(
             binary_path,
             log_path,
             record_entry=True,
@@ -10715,6 +10714,13 @@ class App(QMainWindow):
             suppress_failure_dialog=True,
             batch_mode=True,
         )
+
+        if not started:
+            # _run_with_progress can fail early (e.g., ASLR disable not permitted in batch mode).
+            # Always continue to avoid stalling the batch.
+            if dialog is not None:
+                dialog.append_output(f"[{batch_index}/{batch_total}] Skipping: unable to start run.\n")
+            QTimer.singleShot(0, self._run_next_sanitized_batch)
 
     def reveal_sanitized_binary(self) -> None:
         selection = self._selected_sanitized_output()
@@ -11815,6 +11821,10 @@ class App(QMainWindow):
 
         worker.succeeded.connect(self._handle_run_worker_success)
         worker.failed.connect(self._handle_run_worker_failure)
+        # RunWorker.run() does not stop the QThread event loop by itself.
+        # Ensure the thread quits so thread.finished triggers cleanup and batch can continue.
+        worker.succeeded.connect(thread.quit)
+        worker.failed.connect(thread.quit)
         thread.finished.connect(self._cleanup_run_worker)
         dialog.finished.connect(self._cleanup_run_worker)
 
@@ -11832,6 +11842,15 @@ class App(QMainWindow):
 
     def _request_terminate_current_run(self, *, reason: str) -> None:
         self._request_stop_current_run_internal(reason=reason, cancel_batch=False)
+
+    def _stop_logging_async(self) -> None:
+        def _stop() -> None:
+            try:
+                self.controller.stop_logging()
+            except Exception as exc:  # pragma: no cover - defensive stop
+                QTimer.singleShot(0, lambda: self._append_console(f"Unable to stop run: {exc}"))
+
+        threading.Thread(target=_stop, daemon=True).start()
 
     def _request_stop_current_run_internal(self, *, reason: str, cancel_batch: bool) -> None:
         if self._run_stop_requested:
@@ -11853,10 +11872,8 @@ class App(QMainWindow):
         self._append_console(console_msg)
         if self._current_run_dialog:
             self._current_run_dialog.append_output(dialog_msg)
-        try:
-            self.controller.stop_logging()
-        except Exception as exc:  # pragma: no cover - defensive stop
-            self._append_console(f"Unable to stop run: {exc}")
+        # stop_logging can block (wait/kill escalation). Never run it on the GUI thread.
+        self._stop_logging_async()
 
     def _handle_run_worker_success(self, log_path: str) -> None:
         params = self._current_run_params or {}
@@ -11971,7 +11988,7 @@ class App(QMainWindow):
             if not bool(params.get("batch_mode", False)):
                 QMessageBox.information(self, "Run stopped", "Execution was stopped before completion.")
         else:
-            if bool(params.get("suppress_failure_dialog", False)):
+            if bool(params.get("batch_mode", False)) or bool(params.get("suppress_failure_dialog", False)):
                 self._append_console(f"Error running binary: {error_message}")
             else:
                 self._on_run_failure(error_message)
@@ -12044,7 +12061,6 @@ class App(QMainWindow):
         except Exception:
             self._current_batch_output_buffer = deque()
         self._current_batch_output_dropped = 0
-        if thread is None and worker is None and dialog is None:
         if thread is None and worker is None and dialog is None:
             return
         if thread:
