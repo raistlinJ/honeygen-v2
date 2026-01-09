@@ -75,3 +75,45 @@ def test_view_metrics_enabled_for_multiselect_and_series_resolves(qtbot, tmp_pat
     labels = [item.label for item in series]
     assert any("(Original)" in label for label in labels)
     assert Path(str(out1)).name in labels
+
+
+@pytest.mark.qt_no_exception_capture
+def test_view_metrics_fallback_matches_by_binary_path(qtbot, tmp_path, monkeypatch):
+    app = _make_isolated_app(qtbot, tmp_path, monkeypatch)
+
+    out1 = tmp_path / "san1"
+    out1.write_text("x")
+    now = datetime.now()
+
+    parent = RunEntry(
+        entry_id="p1",
+        name="parent",
+        binary_path=str(tmp_path / "parentbin"),
+        log_path=str(tmp_path / "parentlog"),
+        timestamp=now,
+        sanitized_outputs=[SanitizedBinaryOutput(output_id="o1", output_path=str(out1), works=None, generated_at=now)],
+        run_metrics={"wall_time_ms": 123.0},
+    )
+
+    # Simulate a sanitized run whose sanitized_binary_path metadata doesn't match the selected output
+    # (e.g., copy-to-original path), but binary_path points at the selected output.
+    san_run = RunEntry(
+        entry_id="s1",
+        name="parent (Sanitized)",
+        binary_path=str(out1),
+        log_path=str(tmp_path / "sanlog1"),
+        timestamp=now,
+        sanitized_binary_path=str(tmp_path / "different_location" / "san1"),
+        parent_entry_id=parent.entry_id,
+        is_sanitized_run=True,
+        run_metrics={"wall_time_ms": 456.0, "peak_rss_bytes": 1024 * 1024},
+    )
+
+    app.run_entries = [parent, san_run]
+    app._refresh_entry_views(None)
+
+    selections = [(parent, parent.sanitized_outputs[0])]
+    series = app._metrics_series_for_sanitized_selections(selections)
+    labels = [item.label for item in series]
+    assert any("(Original)" in label for label in labels)
+    assert Path(str(out1)).name in labels

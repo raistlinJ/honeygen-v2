@@ -8526,9 +8526,35 @@ class App(QMainWindow):
                 continue
             candidates.append(entry)
         if not candidates:
-            return None
+            # Fallback: match by resolved executable path only.
+            # This helps when sanitized runs were started via a copied path (copy-to-original)
+            # or when stored paths differ in formatting (symlinks/relative paths).
+            fallback: list[RunEntry] = []
+            for entry in self.run_entries:
+                if not getattr(entry, "is_sanitized_run", False):
+                    continue
+                metrics = getattr(entry, "run_metrics", None)
+                if not isinstance(metrics, dict) or not metrics:
+                    continue
+                raw_san = str(getattr(entry, "sanitized_binary_path", "") or "")
+                raw_bin = str(getattr(entry, "binary_path", "") or "")
+                try:
+                    san_resolved = str(Path(raw_san).resolve()) if raw_san else ""
+                except Exception:
+                    san_resolved = raw_san
+                try:
+                    bin_resolved = str(Path(raw_bin).resolve()) if raw_bin else ""
+                except Exception:
+                    bin_resolved = raw_bin
+                if target_resolved and (san_resolved == target_resolved or bin_resolved == target_resolved):
+                    fallback.append(entry)
+            if not fallback:
+                return None
+            fallback.sort(key=lambda e: getattr(e, "timestamp", datetime.min) or datetime.min, reverse=True)
+            return fallback[0]
         candidates.sort(key=lambda e: getattr(e, "timestamp", datetime.min) or datetime.min, reverse=True)
         return candidates[0]
+
 
     def _metrics_series_for_sanitized_selections(
         self,
