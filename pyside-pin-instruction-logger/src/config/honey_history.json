@@ -5592,7 +5592,980 @@
       "run_metrics": null
     }
   ],
-  "find-honeypot": [],
+  "find-honeypot": [
+    {
+      "entry_id": "baeeb119-8490-4211-b78b-107d3727a829",
+      "name": "find @ 2026-01-12 20:34:26",
+      "binary_path": "/bin/find",
+      "log_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/find-honeypot/instruction_log_find_2026-01-12_20_34_26.txt",
+      "timestamp": "2026-01-12T20:34:43.422294",
+      "sanitized_binary_path": null,
+      "sanitized_outputs": [],
+      "parent_entry_id": null,
+      "is_sanitized_run": false,
+      "prepared_segments": [],
+      "prepared_at": null,
+      "binary_offset": 0,
+      "trace_address_count": 0,
+      "binary_instruction_count": 0,
+      "sanitized_total_instructions": 0,
+      "sanitized_preserved_instructions": 0,
+      "sanitized_nopped_instructions": 0,
+      "target_args": [
+        "/"
+      ],
+      "use_sudo": true,
+      "module_filters": [
+        "find"
+      ],
+      "pre_run_command": null,
+      "run_metrics": {
+        "started_at": 1768275275.3933086,
+        "ended_at": 1768275283.4222753,
+        "wall_time_ms": 8028
+      }
+    },
+    {
+      "entry_id": "00653177-4bad-475b-8978-96ba1679e088",
+      "name": "find @ 2026-01-12 20:37:22",
+      "binary_path": "/bin/find",
+      "log_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/find-honeypot/instruction_log_find_2026-01-12_20_37_22.txt",
+      "timestamp": "2026-01-12T20:37:47.856105",
+      "sanitized_binary_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/find-honeypot/find_2026-01-12_20_37_22/sanitized/find_gap100_pad2000_icf400_jt800_1",
+      "sanitized_outputs": [
+        {
+          "output_id": "5d0fbfbe-5e4f-49e0-ad50-1eb7bda9b8f6",
+          "output_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/find-honeypot/find_2026-01-12_20_37_22/sanitized/find_gap0_pad2000_icf400_jt800",
+          "works": null,
+          "segment_gap": 0,
+          "segment_padding": 8192,
+          "icf_window": 1024,
+          "jumptable_window": 2048,
+          "total_instructions": 30986,
+          "preserved_instructions": 30986,
+          "nopped_instructions": 0,
+          "generated_at": "2026-01-12T21:38:52.615945"
+        },
+        {
+          "output_id": "f91fed5e-2c9a-4900-a839-b3e0642fec66",
+          "output_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/find-honeypot/find_2026-01-12_20_37_22/sanitized/find_gap100_pad2000_icf400_jt800_1",
+          "works": null,
+          "segment_gap": 256,
+          "segment_padding": 8192,
+          "icf_window": 1024,
+          "jumptable_window": 2048,
+          "total_instructions": 30986,
+          "preserved_instructions": 30643,
+          "nopped_instructions": 343,
+          "generated_at": "2026-01-12T21:38:52.710366"
+        }
+      ],
+      "parent_entry_id": null,
+      "is_sanitized_run": false,
+      "prepared_segments": [
+        {
+          "start": 93824992256000,
+          "end": 93824992256026
+        },
+        {
+          "start": 93824992258272,
+          "end": 93824992258292
+        },
+        {
+          "start": 93824992258352,
+          "end": 93824992258356
+        },
+        {
+          "start": 93824992258464,
+          "end": 93824992258468
+        },
+        {
+          "start": 93824992258528,
+          "end": 93824992258532
+        },
+        {
+          "start": 93824992258576,
+          "end": 93824992258612
+        },
+        {
+          "start": 93824992258672,
+          "end": 93824992258772
+        },
+        {
+          "start": 93824992258816,
+          "end": 93824992258836
+        },
+        {
+          "start": 93824992258880,
+          "end": 93824992258932
+        },
+        {
+          "start": 93824992259056,
+          "end": 93824992259092
+        },
+        {
+          "start": 93824992259168,
+          "end": 93824992259172
+        },
+        {
+          "start": 93824992259216,
+          "end": 93824992259220
+        },
+        {
+          "start": 93824992259312,
+          "end": 93824992259316
+        },
+        {
+          "start": 93824992259536,
+          "end": 93824992259540
+        },
+        {
+          "start": 93824992259600,
+          "end": 93824992259716
+        },
+        {
+          "start": 93824992259872,
+          "end": 93824992259892
+        },
+        {
+          "start": 93824992259936,
+          "end": 93824992259940
+        },
+        {
+          "start": 93824992260064,
+          "end": 93824992260068
+        },
+        {
+          "start": 93824992260192,
+          "end": 93824992260212
+        },
+        {
+          "start": 93824992260320,
+          "end": 93824992260372
+        },
+        {
+          "start": 93824992260464,
+          "end": 93824992260516
+        },
+        {
+          "start": 93824992265024,
+          "end": 93824992265823
+        },
+        {
+          "start": 93824992266496,
+          "end": 93824992266501
+        },
+        {
+          "start": 93824992266640,
+          "end": 93824992267124
+        },
+        {
+          "start": 93824992267558,
+          "end": 93824992267841
+        },
+        {
+          "start": 93824992268014,
+          "end": 93824992268087
+        },
+        {
+          "start": 93824992268432,
+          "end": 93824992268616
+        },
+        {
+          "start": 93824992268695,
+          "end": 93824992268713
+        },
+        {
+          "start": 93824992269616,
+          "end": 93824992269844
+        },
+        {
+          "start": 93824992271808,
+          "end": 93824992271874
+        },
+        {
+          "start": 93824992272182,
+          "end": 93824992272423
+        },
+        {
+          "start": 93824992272800,
+          "end": 93824992272897
+        },
+        {
+          "start": 93824992273025,
+          "end": 93824992273066
+        },
+        {
+          "start": 93824992273136,
+          "end": 93824992273197
+        },
+        {
+          "start": 93824992273248,
+          "end": 93824992273347
+        },
+        {
+          "start": 93824992273936,
+          "end": 93824992274310
+        },
+        {
+          "start": 93824992274389,
+          "end": 93824992274423
+        },
+        {
+          "start": 93824992274528,
+          "end": 93824992274562
+        },
+        {
+          "start": 93824992274672,
+          "end": 93824992274757
+        },
+        {
+          "start": 93824992275440,
+          "end": 93824992275504
+        },
+        {
+          "start": 93824992275664,
+          "end": 93824992275749
+        },
+        {
+          "start": 93824992276336,
+          "end": 93824992276509
+        },
+        {
+          "start": 93824992276576,
+          "end": 93824992276620
+        },
+        {
+          "start": 93824992278416,
+          "end": 93824992278519
+        },
+        {
+          "start": 93824992278657,
+          "end": 93824992278709
+        },
+        {
+          "start": 93824992278761,
+          "end": 93824992278764
+        },
+        {
+          "start": 93824992278969,
+          "end": 93824992279103
+        },
+        {
+          "start": 93824992283248,
+          "end": 93824992283334
+        },
+        {
+          "start": 93824992283368,
+          "end": 93824992283441
+        },
+        {
+          "start": 93824992284624,
+          "end": 93824992284759
+        },
+        {
+          "start": 93824992284792,
+          "end": 93824992284820
+        },
+        {
+          "start": 93824992285008,
+          "end": 93824992285008
+        },
+        {
+          "start": 93824992285568,
+          "end": 93824992285654
+        },
+        {
+          "start": 93824992285689,
+          "end": 93824992285776
+        },
+        {
+          "start": 93824992285840,
+          "end": 93824992286115
+        },
+        {
+          "start": 93824992286172,
+          "end": 93824992286204
+        },
+        {
+          "start": 93824992286288,
+          "end": 93824992286431
+        },
+        {
+          "start": 93824992286685,
+          "end": 93824992286791
+        },
+        {
+          "start": 93824992286864,
+          "end": 93824992286916
+        },
+        {
+          "start": 93824992287424,
+          "end": 93824992287838
+        },
+        {
+          "start": 93824992287904,
+          "end": 93824992288097
+        },
+        {
+          "start": 93824992288144,
+          "end": 93824992288194
+        },
+        {
+          "start": 93824992288355,
+          "end": 93824992288366
+        },
+        {
+          "start": 93824992288527,
+          "end": 93824992288567
+        },
+        {
+          "start": 93824992288728,
+          "end": 93824992288739
+        },
+        {
+          "start": 93824992288900,
+          "end": 93824992289107
+        },
+        {
+          "start": 93824992289600,
+          "end": 93824992289812
+        },
+        {
+          "start": 93824992297152,
+          "end": 93824992297809
+        },
+        {
+          "start": 93824992298016,
+          "end": 93824992298050
+        },
+        {
+          "start": 93824992298144,
+          "end": 93824992298164
+        },
+        {
+          "start": 93824992298920,
+          "end": 93824992299143
+        },
+        {
+          "start": 93824992299200,
+          "end": 93824992299270
+        },
+        {
+          "start": 93824992299632,
+          "end": 93824992300111
+        },
+        {
+          "start": 93824992300186,
+          "end": 93824992300273
+        },
+        {
+          "start": 93824992300376,
+          "end": 93824992300396
+        },
+        {
+          "start": 93824992300512,
+          "end": 93824992300826
+        },
+        {
+          "start": 93824992300872,
+          "end": 93824992301029
+        },
+        {
+          "start": 93824992301145,
+          "end": 93824992301165
+        },
+        {
+          "start": 93824992301252,
+          "end": 93824992301359
+        },
+        {
+          "start": 93824992301404,
+          "end": 93824992301414
+        },
+        {
+          "start": 93824992301628,
+          "end": 93824992301646
+        },
+        {
+          "start": 93824992301753,
+          "end": 93824992301779
+        },
+        {
+          "start": 93824992301818,
+          "end": 93824992301841
+        },
+        {
+          "start": 93824992302144,
+          "end": 93824992302186
+        },
+        {
+          "start": 93824992302289,
+          "end": 93824992302326
+        },
+        {
+          "start": 93824992302390,
+          "end": 93824992302423
+        },
+        {
+          "start": 93824992302576,
+          "end": 93824992302611
+        },
+        {
+          "start": 93824992302712,
+          "end": 93824992302758
+        },
+        {
+          "start": 93824992302792,
+          "end": 93824992302831
+        },
+        {
+          "start": 93824992302991,
+          "end": 93824992303018
+        },
+        {
+          "start": 93824992303239,
+          "end": 93824992303259
+        },
+        {
+          "start": 93824992310816,
+          "end": 93824992310983
+        },
+        {
+          "start": 93824992311120,
+          "end": 93824992311369
+        },
+        {
+          "start": 93824992329696,
+          "end": 93824992329798
+        },
+        {
+          "start": 93824992330304,
+          "end": 93824992330520
+        },
+        {
+          "start": 93824992330816,
+          "end": 93824992330925
+        },
+        {
+          "start": 93824992331024,
+          "end": 93824992331038
+        },
+        {
+          "start": 93824992331152,
+          "end": 93824992331157
+        },
+        {
+          "start": 93824992331328,
+          "end": 93824992331373
+        },
+        {
+          "start": 93824992333168,
+          "end": 93824992333325
+        },
+        {
+          "start": 93824992335648,
+          "end": 93824992335705
+        },
+        {
+          "start": 93824992335776,
+          "end": 93824992336077
+        },
+        {
+          "start": 93824992337024,
+          "end": 93824992337536
+        },
+        {
+          "start": 93824992338384,
+          "end": 93824992338411
+        },
+        {
+          "start": 93824992338480,
+          "end": 93824992338501
+        },
+        {
+          "start": 93824992338944,
+          "end": 93824992339163
+        },
+        {
+          "start": 93824992339320,
+          "end": 93824992339351
+        },
+        {
+          "start": 93824992339440,
+          "end": 93824992339453
+        },
+        {
+          "start": 93824992347792,
+          "end": 93824992347819
+        },
+        {
+          "start": 93824992349152,
+          "end": 93824992349209
+        },
+        {
+          "start": 93824992349296,
+          "end": 93824992349307
+        },
+        {
+          "start": 93824992349340,
+          "end": 93824992349340
+        },
+        {
+          "start": 93824992349728,
+          "end": 93824992349828
+        },
+        {
+          "start": 93824992349872,
+          "end": 93824992350067
+        },
+        {
+          "start": 93824992350128,
+          "end": 93824992350176
+        },
+        {
+          "start": 93824992350210,
+          "end": 93824992350283
+        },
+        {
+          "start": 93824992350320,
+          "end": 93824992350388
+        },
+        {
+          "start": 93824992350424,
+          "end": 93824992350449
+        },
+        {
+          "start": 93824992352128,
+          "end": 93824992352305
+        },
+        {
+          "start": 93824992352592,
+          "end": 93824992352693
+        },
+        {
+          "start": 93824992353024,
+          "end": 93824992353117
+        },
+        {
+          "start": 93824992353568,
+          "end": 93824992353604
+        },
+        {
+          "start": 93824992354976,
+          "end": 93824992355133
+        },
+        {
+          "start": 93824992355344,
+          "end": 93824992355377
+        },
+        {
+          "start": 93824992355456,
+          "end": 93824992355557
+        },
+        {
+          "start": 93824992355592,
+          "end": 93824992355656
+        },
+        {
+          "start": 93824992355936,
+          "end": 93824992356052
+        },
+        {
+          "start": 93824992356088,
+          "end": 93824992356181
+        },
+        {
+          "start": 93824992356224,
+          "end": 93824992356260
+        },
+        {
+          "start": 93824992356311,
+          "end": 93824992356371
+        },
+        {
+          "start": 93824992356464,
+          "end": 93824992356548
+        },
+        {
+          "start": 93824992356688,
+          "end": 93824992356777
+        },
+        {
+          "start": 93824992356832,
+          "end": 93824992356880
+        },
+        {
+          "start": 93824992357014,
+          "end": 93824992357052
+        },
+        {
+          "start": 93824992357392,
+          "end": 93824992357478
+        },
+        {
+          "start": 93824992357552,
+          "end": 93824992357557
+        },
+        {
+          "start": 93824992357728,
+          "end": 93824992357913
+        },
+        {
+          "start": 93824992357952,
+          "end": 93824992358022
+        },
+        {
+          "start": 93824992358096,
+          "end": 93824992358366
+        },
+        {
+          "start": 93824992358420,
+          "end": 93824992358719
+        },
+        {
+          "start": 93824992359072,
+          "end": 93824992359437
+        },
+        {
+          "start": 93824992359472,
+          "end": 93824992359529
+        },
+        {
+          "start": 93824992359596,
+          "end": 93824992360130
+        },
+        {
+          "start": 93824992360672,
+          "end": 93824992360767
+        },
+        {
+          "start": 93824992360800,
+          "end": 93824992360963
+        },
+        {
+          "start": 93824992361229,
+          "end": 93824992361516
+        },
+        {
+          "start": 93824992361568,
+          "end": 93824992361591
+        },
+        {
+          "start": 93824992361624,
+          "end": 93824992361720
+        },
+        {
+          "start": 93824992361794,
+          "end": 93824992361902
+        },
+        {
+          "start": 93824992361938,
+          "end": 93824992361942
+        },
+        {
+          "start": 93824992362040,
+          "end": 93824992362133
+        },
+        {
+          "start": 93824992362261,
+          "end": 93824992362312
+        },
+        {
+          "start": 93824992362832,
+          "end": 93824992362866
+        },
+        {
+          "start": 93824992362933,
+          "end": 93824992363246
+        },
+        {
+          "start": 93824992363312,
+          "end": 93824992363319
+        },
+        {
+          "start": 93824992363382,
+          "end": 93824992363497
+        },
+        {
+          "start": 93824992371680,
+          "end": 93824992371716
+        },
+        {
+          "start": 93824992371792,
+          "end": 93824992371853
+        },
+        {
+          "start": 93824992372288,
+          "end": 93824992372337
+        },
+        {
+          "start": 93824992372408,
+          "end": 93824992372432
+        },
+        {
+          "start": 93824992379072,
+          "end": 93824992379159
+        },
+        {
+          "start": 93824992391968,
+          "end": 93824992392000
+        }
+      ],
+      "prepared_at": "2026-01-12T20:38:01.129829",
+      "binary_offset": 93824992231424,
+      "trace_address_count": 4023,
+      "binary_instruction_count": 31980,
+      "sanitized_total_instructions": 30986,
+      "sanitized_preserved_instructions": 30643,
+      "sanitized_nopped_instructions": 343,
+      "target_args": [
+        "/etc",
+        "-name",
+        "test.log"
+      ],
+      "use_sudo": true,
+      "module_filters": [
+        "find"
+      ],
+      "pre_run_command": null,
+      "run_metrics": null
+    },
+    {
+      "entry_id": "6f5a47bd-379b-42c9-8a56-ca7144b641db",
+      "name": "find @ 2026-01-12 20:37:22 (Sanitized)",
+      "binary_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/find-honeypot/find_2026-01-12_20_37_22/sanitized/find_gap2000_pad2000_icf400_jt800",
+      "log_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/find-honeypot/instruction_log_find_2026-01-12_20_37_22_Sanitized.txt",
+      "timestamp": "2026-01-12T20:41:14.986057",
+      "sanitized_binary_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/find-honeypot/find_2026-01-12_20_37_22/sanitized/find_gap2000_pad2000_icf400_jt800",
+      "sanitized_outputs": [
+        {
+          "output_id": "6b85abc9-ac92-4a75-8729-4e0fa9df63d3",
+          "output_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/find-honeypot/find_2026-01-12_20_37_22/sanitized/find_gap2000_pad2000_icf400_jt800",
+          "works": null,
+          "segment_gap": 0,
+          "segment_padding": 0,
+          "icf_window": 0,
+          "jumptable_window": 0,
+          "total_instructions": 0,
+          "preserved_instructions": 0,
+          "nopped_instructions": 0,
+          "generated_at": null
+        }
+      ],
+      "parent_entry_id": "00653177-4bad-475b-8978-96ba1679e088",
+      "is_sanitized_run": true,
+      "prepared_segments": [],
+      "prepared_at": null,
+      "binary_offset": 0,
+      "trace_address_count": 0,
+      "binary_instruction_count": 0,
+      "sanitized_total_instructions": 0,
+      "sanitized_preserved_instructions": 0,
+      "sanitized_nopped_instructions": 0,
+      "target_args": [
+        "/etc",
+        "-name",
+        "test.log"
+      ],
+      "use_sudo": true,
+      "module_filters": [
+        "find_gap2000_pad2000_icf400_jt800",
+        "find"
+      ],
+      "pre_run_command": null,
+      "run_metrics": {
+        "started_at": 1768275657.9565046,
+        "ended_at": 1768275674.9098961,
+        "wall_time_ms": 16953,
+        "cpu_user_s": 0.0,
+        "cpu_system_s": 0.0,
+        "cpu_load_1s": [
+          {
+            "t_s": 0.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 1.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 2.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 3.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 4.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 5.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 6.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 7.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 8.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 9.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 10.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 11.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 12.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 13.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 14.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 15.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 16.0,
+            "cpu_percent": 0.0
+          }
+        ],
+        "peak_rss_bytes": 0
+      }
+    },
+    {
+      "entry_id": "49f73da1-58f0-4ddd-9d5e-a80f820535c7",
+      "name": "find @ 2026-01-12 20:37:22 (Sanitized)",
+      "binary_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/find-honeypot/find_2026-01-12_20_37_22/sanitized/find_gap100_pad2000_icf400_jt800_1",
+      "log_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/find-honeypot/instruction_log_find_2026-01-12_20_37_22_Sanitized.txt",
+      "timestamp": "2026-01-12T21:40:36.768808",
+      "sanitized_binary_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/find-honeypot/find_2026-01-12_20_37_22/sanitized/find_gap100_pad2000_icf400_jt800_1",
+      "sanitized_outputs": [],
+      "parent_entry_id": "00653177-4bad-475b-8978-96ba1679e088",
+      "is_sanitized_run": true,
+      "prepared_segments": [],
+      "prepared_at": null,
+      "binary_offset": 0,
+      "trace_address_count": 0,
+      "binary_instruction_count": 0,
+      "sanitized_total_instructions": 0,
+      "sanitized_preserved_instructions": 0,
+      "sanitized_nopped_instructions": 0,
+      "target_args": [
+        "/etc",
+        "-name",
+        "test.log"
+      ],
+      "use_sudo": true,
+      "module_filters": [
+        "find_gap100_pad2000_icf400_jt800_1",
+        "find"
+      ],
+      "pre_run_command": null,
+      "run_metrics": {
+        "started_at": 1768279219.3996878,
+        "ended_at": 1768279236.4071455,
+        "wall_time_ms": 17007,
+        "cpu_user_s": 9.05,
+        "cpu_system_s": 7.86,
+        "cpu_load_1s": [
+          {
+            "t_s": 0.0,
+            "cpu_percent": 99.42696900988976
+          },
+          {
+            "t_s": 1.0,
+            "cpu_percent": 99.42696900988976
+          },
+          {
+            "t_s": 2.0,
+            "cpu_percent": 99.42696900988976
+          },
+          {
+            "t_s": 3.0,
+            "cpu_percent": 99.42696900988976
+          },
+          {
+            "t_s": 4.0,
+            "cpu_percent": 99.42696900988976
+          },
+          {
+            "t_s": 5.0,
+            "cpu_percent": 99.42696900988976
+          },
+          {
+            "t_s": 6.0,
+            "cpu_percent": 99.42696900988976
+          },
+          {
+            "t_s": 7.0,
+            "cpu_percent": 99.42696900988976
+          },
+          {
+            "t_s": 8.0,
+            "cpu_percent": 99.42696900988976
+          },
+          {
+            "t_s": 9.0,
+            "cpu_percent": 99.42696900988976
+          },
+          {
+            "t_s": 10.0,
+            "cpu_percent": 99.42696900988976
+          },
+          {
+            "t_s": 11.0,
+            "cpu_percent": 99.42696900988976
+          },
+          {
+            "t_s": 12.0,
+            "cpu_percent": 99.42696900988976
+          },
+          {
+            "t_s": 13.0,
+            "cpu_percent": 99.42696900988976
+          },
+          {
+            "t_s": 14.0,
+            "cpu_percent": 99.42696900988976
+          },
+          {
+            "t_s": 15.0,
+            "cpu_percent": 99.42696900988976
+          },
+          {
+            "t_s": 16.0,
+            "cpu_percent": 99.42696900988976
+          },
+          {
+            "t_s": 17.0,
+            "cpu_percent": 99.42696900988976
+          }
+        ],
+        "peak_rss_bytes": 186888192
+      }
+    }
+  ],
   "nginx": [
     {
       "entry_id": "11c7e2ab-f044-4c65-aeb7-998b9d84ef81",
@@ -9111,6 +10084,249 @@
           },
           {
             "t_s": 28.0,
+            "cpu_percent": 0.0
+          }
+        ],
+        "peak_rss_bytes": 0
+      }
+    },
+    {
+      "entry_id": "d7c09128-405e-4f27-a7bc-3bdd7a485c71",
+      "name": "nginx @ 2026-01-08 18:03:30 (Sanitized)",
+      "binary_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/nginx/nginx_2026-01-08_18_03_30/sanitized/nginx_gap2000_pad0_icf0_jt0",
+      "log_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/nginx/instruction_log_nginx_2026-01-08_18_03_30_Sanitized.txt",
+      "timestamp": "2026-01-12T20:25:59.632493",
+      "sanitized_binary_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/nginx/nginx_2026-01-08_18_03_30/sanitized/nginx_gap2000_pad0_icf0_jt0",
+      "sanitized_outputs": [],
+      "parent_entry_id": "11c7e2ab-f044-4c65-aeb7-998b9d84ef81",
+      "is_sanitized_run": true,
+      "prepared_segments": [],
+      "prepared_at": null,
+      "binary_offset": 0,
+      "trace_address_count": 0,
+      "binary_instruction_count": 0,
+      "sanitized_total_instructions": 0,
+      "sanitized_preserved_instructions": 0,
+      "sanitized_nopped_instructions": 0,
+      "target_args": [
+        "-g",
+        "daemon off; master_process off;"
+      ],
+      "use_sudo": true,
+      "module_filters": [
+        "nginx_gap2000_pad0_icf0_jt0",
+        "nginx"
+      ],
+      "pre_run_command": null,
+      "run_metrics": {
+        "started_at": 1768274709.1156309,
+        "ended_at": 1768274759.6269546,
+        "wall_time_ms": 50511,
+        "cpu_user_s": 0.0,
+        "cpu_system_s": 0.0,
+        "cpu_load_1s": [
+          {
+            "t_s": 0.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 1.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 2.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 3.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 4.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 5.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 6.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 7.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 8.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 9.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 10.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 11.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 12.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 13.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 14.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 15.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 16.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 17.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 18.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 19.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 20.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 21.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 22.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 23.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 24.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 25.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 26.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 27.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 28.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 29.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 30.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 31.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 32.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 33.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 34.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 35.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 36.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 37.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 38.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 39.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 40.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 41.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 42.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 43.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 44.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 45.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 46.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 47.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 48.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 49.0,
+            "cpu_percent": 0.0
+          },
+          {
+            "t_s": 50.0,
             "cpu_percent": 0.0
           }
         ],

@@ -232,7 +232,7 @@ class RunWorker(QObject):
         self,
         controller: RunnerController,
         binary_path: str,
-        log_path: str | None,
+        log_path: str | None = None,
         module_filters: list[str] | None = None,
         unique_only: bool = False,
         use_sudo: bool = False,
@@ -344,7 +344,7 @@ class RunWorker(QObject):
                 self._active_prerun_pgid = None
                 if proc.returncode != 0:
                     raise RuntimeError("Pre-run command failed with non-zero exit status")
-            result = self.controller.run_binary(
+            result = self.controller.run_binary( 
                 self.binary_path,
                 log_path=self.log_path,
                 module_filters=self.module_filters,
@@ -3119,46 +3119,136 @@ class MetricsViewerDialog(QDialog):
         header.setWordWrap(True)
         layout.addWidget(header)
 
-        charts_layout = QVBoxLayout()
-        charts_layout.setSpacing(10)
-        layout.addLayout(charts_layout)
+        tabs = QTabWidget(self)
+        layout.addWidget(tabs)
 
-        charts_layout.addWidget(
-            self._build_chart_widget(
-                series,
-                title="Wall Time",
-                y_label="Milliseconds (ms)",
-                value_getter=lambda metrics: metrics.get("wall_time_ms"),
-            )
+        def _tab(widget: QWidget) -> QWidget:
+            page = QWidget(tabs)
+            page_layout = QVBoxLayout(page)
+            page_layout.setContentsMargins(0, 0, 0, 0)
+            page_layout.addWidget(widget)
+            return page
+
+        tabs.addTab(
+            _tab(
+                self._build_chart_widget(
+                    series,
+                    title="Wall Time",
+                    y_label="Milliseconds (ms)",
+                    value_getter=lambda metrics: metrics.get("wall_time_ms"),
+                )
+            ),
+            "Wall Time",
         )
-        charts_layout.addWidget(
-            self._build_chart_widget(
-                series,
-                title="CPU Time",
-                y_label="Seconds (s)",
-                value_getter=lambda metrics: (
-                    (metrics.get("cpu_user_s") or 0) + (metrics.get("cpu_system_s") or 0)
-                ),
-            )
+        tabs.addTab(
+            _tab(
+                self._build_chart_widget(
+                    series,
+                    title="CPU Time",
+                    y_label="Seconds (s)",
+                    value_getter=lambda metrics: (
+                        (metrics.get("cpu_user_s") or 0) + (metrics.get("cpu_system_s") or 0)
+                    ),
+                )
+            ),
+            "CPU Time",
+        )
+        tabs.addTab(
+            _tab(
+                self._build_line_chart_widget(
+                    series,
+                    title="CPU Load (1s)",
+                    x_label="Seconds (s)",
+                    y_label="CPU (%)",
+                    samples_getter=lambda metrics: metrics.get("cpu_load_1s"),
+                )
+            ),
+            "CPU Load",
+        )
+        tabs.addTab(
+            _tab(
+                self._build_chart_widget(
+                    series,
+                    title="Peak RSS",
+                    y_label="MiB",
+                    value_getter=lambda metrics: (metrics.get("peak_rss_bytes") or 0),
+                    value_transform=lambda value: float(value) / (1024.0 * 1024.0),
+                )
+            ),
+            "Peak RSS",
         )
 
-        charts_layout.addWidget(
-            self._build_line_chart_widget(
-                series,
-                title="CPU Load (1s)",
-                x_label="Seconds (s)",
-                y_label="CPU (%)",
-                samples_getter=lambda metrics: metrics.get("cpu_load_1s"),
-            )
+        tabs.addTab(
+            _tab(
+                self._build_line_chart_widget(
+                    series,
+                    title="RSS (1s)",
+                    x_label="Seconds (s)",
+                    y_label="MiB",
+                    samples_getter=lambda metrics: metrics.get("rss_bytes_1s"),
+                    y_key="rss_bytes",
+                    y_transform=lambda value: float(value) / (1024.0 * 1024.0),
+                )
+            ),
+            "RSS",
         )
-        charts_layout.addWidget(
-            self._build_chart_widget(
-                series,
-                title="Peak RSS",
-                y_label="MiB",
-                value_getter=lambda metrics: (metrics.get("peak_rss_bytes") or 0),
-                value_transform=lambda value: float(value) / (1024.0 * 1024.0),
-            )
+
+        tabs.addTab(
+            _tab(
+                self._build_line_chart_widget(
+                    series,
+                    title="I/O Read Rate (1s)",
+                    x_label="Seconds (s)",
+                    y_label="KiB/s",
+                    samples_getter=lambda metrics: metrics.get("io_read_bps_1s"),
+                    y_key="bytes_per_s",
+                    y_transform=lambda value: float(value) / 1024.0,
+                )
+            ),
+            "I/O Read",
+        )
+        tabs.addTab(
+            _tab(
+                self._build_line_chart_widget(
+                    series,
+                    title="I/O Write Rate (1s)",
+                    x_label="Seconds (s)",
+                    y_label="KiB/s",
+                    samples_getter=lambda metrics: metrics.get("io_write_bps_1s"),
+                    y_key="bytes_per_s",
+                    y_transform=lambda value: float(value) / 1024.0,
+                )
+            ),
+            "I/O Write",
+        )
+
+        tabs.addTab(
+            _tab(
+                self._build_line_chart_widget(
+                    series,
+                    title="Network Sent Rate (1s)",
+                    x_label="Seconds (s)",
+                    y_label="KiB/s",
+                    samples_getter=lambda metrics: metrics.get("net_sent_bps_1s"),
+                    y_key="bytes_per_s",
+                    y_transform=lambda value: float(value) / 1024.0,
+                )
+            ),
+            "Net Sent",
+        )
+        tabs.addTab(
+            _tab(
+                self._build_line_chart_widget(
+                    series,
+                    title="Network Received Rate (1s)",
+                    x_label="Seconds (s)",
+                    y_label="KiB/s",
+                    samples_getter=lambda metrics: metrics.get("net_recv_bps_1s"),
+                    y_key="bytes_per_s",
+                    y_transform=lambda value: float(value) / 1024.0,
+                )
+            ),
+            "Net Recv",
         )
 
         buttons = QDialogButtonBox(QDialogButtonBox.Close, self)
@@ -3176,6 +3266,8 @@ class MetricsViewerDialog(QDialog):
         x_label: str,
         y_label: str,
         samples_getter: Callable[[dict[str, object]], object],
+        y_key: str = "cpu_percent",
+        y_transform: Callable[[float], float] | None = None,
     ) -> QWidget:
         try:
             from PySide6.QtCharts import QChart, QChartView, QLineSeries, QValueAxis
@@ -3207,7 +3299,7 @@ class MetricsViewerDialog(QDialog):
                 y_obj: object | None = None
                 if isinstance(sample, dict):
                     x_obj = sample.get("t_s")
-                    y_obj = sample.get("cpu_percent")
+                    y_obj = sample.get(y_key)
                 elif isinstance(sample, (list, tuple)) and len(sample) == 2:
                     x_obj, y_obj = sample
                 else:
@@ -3217,6 +3309,12 @@ class MetricsViewerDialog(QDialog):
                     y = float(y_obj)  # type: ignore[arg-type]
                 except Exception:
                     continue
+
+                if y_transform is not None:
+                    try:
+                        y = float(y_transform(y))
+                    except Exception:
+                        continue
                 line.append(x, y)
                 points_added += 1
                 if x > max_x:
@@ -13004,6 +13102,13 @@ class App(QMainWindow):
             return
         self._run_stop_requested = True
         self._run_stop_reason = (reason or "user").strip() or "user"
+        try:
+            if isinstance(self._current_run_params, dict):
+                self._current_run_params["stop_requested"] = True
+                self._current_run_params["stop_reason"] = self._run_stop_reason
+                self._current_run_params.setdefault("stop_requested_at_epoch", float(time.time()))
+        except Exception:
+            pass
         if cancel_batch and self._sanitized_batch_queue is not None:
             self._sanitized_batch_cancelled = True
             try:
@@ -13037,6 +13142,58 @@ class App(QMainWindow):
             pass
         # stop_logging can block (wait/kill escalation). Never run it on the GUI thread.
         self._stop_logging_async()
+
+    def _maybe_record_stopped_run_entry(self, *, params: dict[str, object], worker) -> None:
+        """Record a stopped run entry exactly once.
+
+        This is used from both the failure handler and cleanup to avoid losing metrics
+        due to Qt signal ordering/races.
+        """
+        try:
+            if not bool(params.get("record_entry", True)):
+                return
+            if not bool(params.get("stop_requested", False)) and not bool(getattr(self, "_run_stop_requested", False)):
+                return
+            if bool(params.get("stop_run_entry_recorded", False)):
+                return
+            binary_path = str(params.get("binary_path") or "").strip()
+            if not binary_path:
+                return
+
+            run_metrics = getattr(worker, "metrics", None) if worker is not None else None
+            if not isinstance(run_metrics, dict) or not run_metrics:
+                try:
+                    started_epoch = float(params.get("assume_works_started_at_epoch") or time.time())
+                except Exception:
+                    started_epoch = float(time.time())
+                try:
+                    started_mono = float(params.get("assume_works_started_at") or time.monotonic())
+                except Exception:
+                    started_mono = float(time.monotonic())
+                ended_epoch = float(time.time())
+                ended_mono = float(time.monotonic())
+                run_metrics = {
+                    "started_at": float(started_epoch),
+                    "ended_at": float(ended_epoch),
+                    "wall_time_ms": int(max(0.0, (ended_mono - started_mono) * 1000.0)),
+                }
+
+            self._record_run_entry(
+                binary_path,
+                params.get("log_path"),
+                run_label=str(params.get("run_label") or "") or None,
+                parent_entry_id=str(params.get("parent_entry_id") or "") or None,
+                sanitized_binary_path=str(params.get("sanitized_binary_path") or "") or None,
+                is_sanitized_run=bool(params.get("is_sanitized_run", False)),
+                target_args=params.get("target_args") if isinstance(params.get("target_args"), list) else None,
+                use_sudo=bool(params.get("use_sudo", False)),
+                module_filters=params.get("module_filters") if isinstance(params.get("module_filters"), list) else None,
+                pre_run_command=str(params.get("pre_run_command") or "") or None,
+                run_metrics=run_metrics if isinstance(run_metrics, dict) else None,
+            )
+            params["stop_run_entry_recorded"] = True
+        except Exception:
+            return
 
     def _terminate_lingering_exe_processes_with_sudo_fallback_async(
         self,
@@ -13405,26 +13562,9 @@ class App(QMainWindow):
             self._run_stop_reason = None
             return
 
-        # Persist any collected metrics even if the run fails/stops so the metrics viewer
-        # can show data for daemonizing/crashing services.
+        # Record a stopped-run entry (if needed) before cleanup clears state.
         try:
-            if binary_path and bool(params.get("record_entry", True)):
-                worker = self._current_run_worker
-                run_metrics = getattr(worker, "metrics", None) if worker is not None else None
-                if isinstance(run_metrics, dict) and run_metrics:
-                    self._record_run_entry(
-                        str(binary_path),
-                        params.get("log_path"),
-                        run_label=params.get("run_label"),
-                        parent_entry_id=params.get("parent_entry_id"),
-                        sanitized_binary_path=params.get("sanitized_binary_path"),
-                        is_sanitized_run=bool(params.get("is_sanitized_run", False)),
-                        target_args=params.get("target_args"),
-                        use_sudo=bool(params.get("use_sudo", False)),
-                        module_filters=params.get("module_filters"),
-                        pre_run_command=params.get("pre_run_command"),
-                        run_metrics=run_metrics,
-                    )
+            self._maybe_record_stopped_run_entry(params=params, worker=self._current_run_worker)
         except Exception:
             pass
 
@@ -13436,6 +13576,12 @@ class App(QMainWindow):
         thread = self._current_run_thread
         worker = self._current_run_worker
         dialog = self._current_run_dialog
+        params = self._current_run_params if isinstance(getattr(self, "_current_run_params", None), dict) else None
+        if params is not None:
+            try:
+                self._maybe_record_stopped_run_entry(params=params, worker=worker)
+            except Exception:
+                pass
         timer = getattr(self, "_current_assume_works_timer", None)
         batch_timer = getattr(self, "_current_batch_output_timer", None)
         if timer is not None:

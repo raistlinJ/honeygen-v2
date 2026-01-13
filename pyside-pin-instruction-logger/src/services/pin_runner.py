@@ -6,10 +6,12 @@ from pathlib import Path
 import subprocess
 import os
 import shutil
+import sys
 from typing import Callable, Sequence
 import signal
 import threading
 import time
+import json
 
 PIN_ROOT_DEFAULT = Path("/home/researchdev/Downloads/pin4")
 
@@ -38,6 +40,9 @@ class PinRunner:
         self.last_metrics: dict[str, object] | None = None
         self._sampler_stop: threading.Event | None = None
         self._sampler_thread: threading.Thread | None = None
+        self._sudo_metrics_process: subprocess.Popen[str] | None = None
+        self._sudo_metrics_stop: threading.Event | None = None
+        self._sudo_metrics_thread: threading.Thread | None = None
 
     def _collect_process_tree_snapshot(self, pid: int) -> tuple[float, float, int]:
         """Return (cpu_user_s, cpu_system_s, rss_bytes_sum) for pid + children (best-effort)."""
@@ -176,10 +181,93 @@ class PinRunner:
         if env:
             combined_env.update(env)
 
+        def _preexec() -> None:
+            os.setsid()
+            try:
+                import resource
+
+                resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+            except Exception:
+                pass
+
         self.last_metrics = None
         want_metrics = bool(collect_cpu_metrics or collect_memory_metrics or collect_timing_metrics)
         start_monotonic = time.monotonic()
         start_epoch = time.time()
+
+        use_sudo_sidecar_metrics = False
+        sudo_sidecar_lines: list[str] = []
+        sudo_sidecar_stop = threading.Event()
+        sudo_sidecar_thread: threading.Thread | None = None
+        sudo_sidecar_proc: subprocess.Popen[str] | None = None
+
+        sidecar_script = self.project_root / "scripts" / "sudo_metrics_sidecar.py"
+        if want_metrics and use_sudo and sudo_password and sidecar_script.exists():
+            try:
+                sidecar_cmd = [
+                    "sudo",
+                    "-S",
+                    "-p",
+                    "",
+                    sys.executable,
+                    str(sidecar_script),
+                    "--exe",
+                    str(binary.resolve()),
+                    "--start-epoch",
+                    str(float(start_epoch)),
+                    "--interval",
+                    "0.2",
+                ]
+                sudo_sidecar_proc = subprocess.Popen(
+                    sidecar_cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    stdin=subprocess.PIPE,
+                    text=True,
+                    bufsize=1,
+                    cwd=self.project_root,
+                    env=combined_env,
+                    preexec_fn=_preexec,
+                )
+                self._sudo_metrics_process = sudo_sidecar_proc
+                self._sudo_metrics_stop = sudo_sidecar_stop
+
+                if sudo_sidecar_proc.stdin is not None:
+                    try:
+                        sudo_sidecar_proc.stdin.write(sudo_password + "\n")
+                        sudo_sidecar_proc.stdin.flush()
+                    except BrokenPipeError:
+                        pass
+                    finally:
+                        try:
+                            sudo_sidecar_proc.stdin.close()
+                        except OSError:
+                            pass
+
+                def _drain_sidecar() -> None:
+                    if sudo_sidecar_proc is None or sudo_sidecar_proc.stdout is None:
+                        return
+                    try:
+                        for line in sudo_sidecar_proc.stdout:
+                            if sudo_sidecar_stop.is_set():
+                                break
+                            clean = line.strip()
+                            if clean:
+                                sudo_sidecar_lines.append(clean)
+                    except Exception:
+                        return
+
+                sudo_sidecar_thread = threading.Thread(target=_drain_sidecar, daemon=True)
+                sudo_sidecar_thread.start()
+                self._sudo_metrics_thread = sudo_sidecar_thread
+                use_sudo_sidecar_metrics = True
+            except Exception:
+                use_sudo_sidecar_metrics = False
+                sudo_sidecar_proc = None
+                sudo_sidecar_thread = None
+                self._sudo_metrics_process = None
+                self._sudo_metrics_stop = None
+                self._sudo_metrics_thread = None
 
         # When running under sudo, psutil often cannot read the target (root) process tree.
         # In that case, fall back to parsing `/usr/bin/time -v` output for aggregate CPU/RSS.
@@ -187,6 +275,8 @@ class PinRunner:
         time_exe = Path("/usr/bin/time")
         if want_metrics and (collect_cpu_metrics or collect_memory_metrics):
             if use_sudo:
+                # Even if a sudo sidecar is enabled, keep `/usr/bin/time -v` available as a
+                # reliable aggregate fallback when the sidecar cannot attach.
                 use_time_metrics = time_exe.exists()
             else:
                 try:
@@ -204,15 +294,6 @@ class PinRunner:
                 raise RuntimeError("Sudo password not provided.")
             command = ["sudo", "-S", "-p", "", *command]
 
-        def _preexec() -> None:
-            os.setsid()
-            try:
-                import resource
-
-                resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-            except Exception:
-                pass
-
         self._process = subprocess.Popen(
             command,
             stdout=subprocess.PIPE,
@@ -229,6 +310,7 @@ class PinRunner:
         last_cpu_user_s = 0.0
         last_cpu_system_s = 0.0
         cpu_load_buckets: dict[int, tuple[float, int]] = {}
+        rss_buckets: dict[int, int] = {}
         time_user_s: float | None = None
         time_system_s: float | None = None
         time_max_rss_kb: int | None = None
@@ -237,7 +319,7 @@ class PinRunner:
         # Expose sampler handles so stop() can halt sampling before termination.
         self._sampler_stop = stop_sampler
         self._sampler_thread = None
-        if want_metrics and self._process is not None and not use_time_metrics:
+        if want_metrics and self._process is not None and not use_time_metrics and not use_sudo:
             try:
                 def _sample() -> None:
                     nonlocal peak_rss_bytes
@@ -266,6 +348,10 @@ class PinRunner:
                             peak_rss_bytes = rss_sum
                         last_cpu_user_s = float(user_s or 0.0)
                         last_cpu_system_s = float(system_s or 0.0)
+
+                        if collect_memory_metrics:
+                            bucket = int(max(0.0, now_t - start_monotonic))
+                            rss_buckets[bucket] = max(rss_buckets.get(bucket, 0), int(rss_sum or 0))
 
                         if collect_cpu_metrics:
                             dt = float(now_t - prev_t)
@@ -346,6 +432,28 @@ class PinRunner:
             self._sampler_stop = None
             self._sampler_thread = None
 
+            sudo_sidecar_stop.set()
+            if sudo_sidecar_proc is not None:
+                try:
+                    sudo_sidecar_proc.terminate()
+                except Exception:
+                    pass
+                try:
+                    sudo_sidecar_proc.wait(timeout=1.0)
+                except Exception:
+                    try:
+                        sudo_sidecar_proc.kill()
+                    except Exception:
+                        pass
+            if sudo_sidecar_thread is not None:
+                try:
+                    sudo_sidecar_thread.join(timeout=1.0)
+                except Exception:
+                    pass
+            self._sudo_metrics_process = None
+            self._sudo_metrics_stop = None
+            self._sudo_metrics_thread = None
+
         self._process.wait()
 
         if use_time_metrics and stdout_lines:
@@ -400,6 +508,188 @@ class PinRunner:
                     metrics["peak_rss_bytes"] = int(max(0, int(time_max_rss_kb) * 1024))
                 else:
                     metrics["peak_rss_bytes"] = int(max(0, int(peak_rss_bytes)))
+
+                # Provide an RSS time series for non-sudo psutil sampling.
+                if (not use_time_metrics) and (not use_sudo):
+                    elapsed_s = max(0.0, float(end_monotonic - start_monotonic))
+                    duration_s = int(elapsed_s) if float(int(elapsed_s)) == elapsed_s else int(elapsed_s) + 1
+                    duration_s = max(1, duration_s)
+                    rss_series: list[dict[str, float]] = []
+                    for second in range(0, duration_s):
+                        rss_series.append({"t_s": float(second), "rss_bytes": float(rss_buckets.get(second, 0))})
+                    metrics["rss_bytes_1s"] = rss_series
+
+            if use_sudo_sidecar_metrics and sudo_sidecar_lines:
+                sidecar_samples: list[dict[str, float | int]] = []
+                sidecar_max_alive = 0
+                sidecar_max_tracked = 0
+                for line in sudo_sidecar_lines:
+                    try:
+                        data = json.loads(line)
+                    except Exception:
+                        continue
+                    if not isinstance(data, dict):
+                        continue
+                    if "t_s" not in data:
+                        continue
+                    try:
+                        t_s = float(data.get("t_s") or 0.0)
+                    except Exception:
+                        continue
+                    try:
+                        cpu_user_s = float(data.get("cpu_user_s") or 0.0)
+                        cpu_system_s = float(data.get("cpu_system_s") or 0.0)
+                        rss_bytes = int(data.get("rss_bytes") or 0)
+                        io_read_bytes = int(data.get("io_read_bytes") or 0)
+                        io_write_bytes = int(data.get("io_write_bytes") or 0)
+                        net_sent_bytes = int(data.get("net_sent_bytes") or 0)
+                        net_recv_bytes = int(data.get("net_recv_bytes") or 0)
+                        tracked_pids = int(data.get("tracked_pids") or 0)
+                        alive_pids = int(data.get("alive_pids") or 0)
+                    except Exception:
+                        continue
+
+                    sidecar_max_tracked = max(sidecar_max_tracked, max(0, tracked_pids))
+                    sidecar_max_alive = max(sidecar_max_alive, max(0, alive_pids))
+
+                    sidecar_samples.append(
+                        {
+                            "t_s": float(max(0.0, t_s)),
+                            "cpu_user_s": float(max(0.0, cpu_user_s)),
+                            "cpu_system_s": float(max(0.0, cpu_system_s)),
+                            "rss_bytes": int(max(0, rss_bytes)),
+                            "io_read_bytes": int(max(0, io_read_bytes)),
+                            "io_write_bytes": int(max(0, io_write_bytes)),
+                            "net_sent_bytes": int(max(0, net_sent_bytes)),
+                            "net_recv_bytes": int(max(0, net_recv_bytes)),
+                            "tracked_pids": int(max(0, tracked_pids)),
+                            "alive_pids": int(max(0, alive_pids)),
+                        }
+                    )
+
+                sidecar_samples.sort(key=lambda item: float(item.get("t_s") or 0.0))
+                sidecar_valid = (sidecar_max_alive > 0) or (sidecar_max_tracked > 0)
+                if sidecar_samples and sidecar_valid:
+                    # Override aggregate CPU/memory with sudo sidecar values when available.
+                    last = sidecar_samples[-1]
+                    if collect_cpu_metrics:
+                        metrics["cpu_user_s"] = float(last.get("cpu_user_s") or 0.0)
+                        metrics["cpu_system_s"] = float(last.get("cpu_system_s") or 0.0)
+
+                        cpu_buckets: dict[int, tuple[float, int]] = {}
+                        prev = sidecar_samples[0]
+                        for cur in sidecar_samples[1:]:
+                            dt = float(cur["t_s"] - prev["t_s"])
+                            if dt <= 0:
+                                prev = cur
+                                continue
+                            prev_total = float(prev["cpu_user_s"] + prev["cpu_system_s"])
+                            cur_total = float(cur["cpu_user_s"] + cur["cpu_system_s"])
+                            delta_cpu = float(cur_total - prev_total)
+                            if delta_cpu < 0:
+                                prev = cur
+                                continue
+                            cpu_percent = float(delta_cpu / dt) * 100.0
+                            bucket = int(max(0.0, float(cur["t_s"])))
+                            sum_val, count_val = cpu_buckets.get(bucket, (0.0, 0))
+                            cpu_buckets[bucket] = (sum_val + cpu_percent, count_val + 1)
+                            prev = cur
+
+                        elapsed_s = max(0.0, float(end_monotonic - start_monotonic))
+                        duration_s = int(elapsed_s) if float(int(elapsed_s)) == elapsed_s else int(elapsed_s) + 1
+                        duration_s = max(1, duration_s)
+                        load_series = []
+                        for second in range(0, duration_s):
+                            sum_val, count_val = cpu_buckets.get(second, (0.0, 0))
+                            avg = float(sum_val / count_val) if count_val else 0.0
+                            load_series.append({"t_s": float(second), "cpu_percent": float(avg)})
+                        metrics["cpu_load_1s"] = load_series
+
+                    if collect_memory_metrics:
+                        peak = int(max(int(item.get("rss_bytes") or 0) for item in sidecar_samples))
+                        metrics["peak_rss_bytes"] = int(max(0, peak))
+
+                        rss_buckets: dict[int, int] = {}
+                        for item in sidecar_samples:
+                            bucket = int(max(0.0, float(item.get("t_s") or 0.0)))
+                            rss = int(item.get("rss_bytes") or 0)
+                            rss_buckets[bucket] = max(rss_buckets.get(bucket, 0), rss)
+
+                        elapsed_s = max(0.0, float(end_monotonic - start_monotonic))
+                        duration_s = int(elapsed_s) if float(int(elapsed_s)) == elapsed_s else int(elapsed_s) + 1
+                        duration_s = max(1, duration_s)
+                        rss_series: list[dict[str, float]] = []
+                        for second in range(0, duration_s):
+                            rss_series.append({"t_s": float(second), "rss_bytes": float(rss_buckets.get(second, 0))})
+                        metrics["rss_bytes_1s"] = rss_series
+
+                    # Best-effort I/O + network deltas (note: network is system-wide).
+                    try:
+                        metrics["io_read_bytes"] = int(last.get("io_read_bytes") or 0)
+                        metrics["io_write_bytes"] = int(last.get("io_write_bytes") or 0)
+                        metrics["net_sent_bytes"] = int(last.get("net_sent_bytes") or 0)
+                        metrics["net_recv_bytes"] = int(last.get("net_recv_bytes") or 0)
+                    except Exception:
+                        pass
+
+                    def _rate_series(key: str, out_key: str) -> None:
+                        buckets: dict[int, tuple[float, int]] = {}
+                        prev = sidecar_samples[0]
+                        for cur in sidecar_samples[1:]:
+                            dt = float(cur["t_s"] - prev["t_s"])
+                            if dt <= 0:
+                                prev = cur
+                                continue
+                            delta = float(int(cur.get(key) or 0) - int(prev.get(key) or 0))
+                            if delta < 0:
+                                prev = cur
+                                continue
+                            rate = float(delta / dt)
+                            bucket = int(max(0.0, float(cur["t_s"])))
+                            sum_val, count_val = buckets.get(bucket, (0.0, 0))
+                            buckets[bucket] = (sum_val + rate, count_val + 1)
+                            prev = cur
+
+                        elapsed_s = max(0.0, float(end_monotonic - start_monotonic))
+                        duration_s = int(elapsed_s) if float(int(elapsed_s)) == elapsed_s else int(elapsed_s) + 1
+                        duration_s = max(1, duration_s)
+                        series: list[dict[str, float]] = []
+                        for second in range(0, duration_s):
+                            sum_val, count_val = buckets.get(second, (0.0, 0))
+                            avg = float(sum_val / count_val) if count_val else 0.0
+                            series.append({"t_s": float(second), "bytes_per_s": float(avg)})
+                        metrics[out_key] = series
+
+                    _rate_series("io_read_bytes", "io_read_bps_1s")
+                    _rate_series("io_write_bytes", "io_write_bps_1s")
+                    _rate_series("net_sent_bytes", "net_sent_bps_1s")
+                    _rate_series("net_recv_bytes", "net_recv_bps_1s")
+
+            # If we only have aggregate CPU (e.g., /usr/bin/time -v) or the time-series bucket
+            # calculation produced no usable non-zero points, synthesize a simple per-second series.
+            if collect_cpu_metrics:
+                series = metrics.get("cpu_load_1s")
+                cpu_user_s = float(metrics.get("cpu_user_s") or 0.0)
+                cpu_system_s = float(metrics.get("cpu_system_s") or 0.0)
+                total_cpu_s = max(0.0, cpu_user_s + cpu_system_s)
+                elapsed_s = max(0.0, float(end_monotonic - start_monotonic))
+                has_nonzero = False
+                if isinstance(series, list):
+                    for pt in series:
+                        try:
+                            if float(pt.get("cpu_percent") or 0.0) > 0.0:
+                                has_nonzero = True
+                                break
+                        except Exception:
+                            continue
+
+                if isinstance(series, list) and (not has_nonzero) and total_cpu_s > 0.0 and elapsed_s > 0.0:
+                    cpu_percent = float(total_cpu_s / elapsed_s) * 100.0
+                    for pt in series:
+                        try:
+                            pt["cpu_percent"] = float(cpu_percent)
+                        except Exception:
+                            continue
             self.last_metrics = metrics
 
         if timed_out:
@@ -436,6 +726,16 @@ class PinRunner:
                 self._sampler_stop.set()
             if self._sampler_thread is not None and self._sampler_thread.is_alive():
                 self._sampler_thread.join(timeout=0.5)
+        except Exception:
+            pass
+        try:
+            if self._sudo_metrics_stop is not None:
+                self._sudo_metrics_stop.set()
+            if self._sudo_metrics_process is not None and self._sudo_metrics_process.poll() is None:
+                try:
+                    self._sudo_metrics_process.terminate()
+                except Exception:
+                    pass
         except Exception:
             pass
         proc = self._process

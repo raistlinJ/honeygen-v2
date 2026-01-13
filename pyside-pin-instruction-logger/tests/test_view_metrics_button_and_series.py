@@ -117,3 +117,124 @@ def test_view_metrics_fallback_matches_by_binary_path(qtbot, tmp_path, monkeypat
     labels = [item.label for item in series]
     assert any("(Original)" in label for label in labels)
     assert Path(str(out1)).name in labels
+
+
+@pytest.mark.qt_no_exception_capture
+def test_stopped_sanitized_run_records_minimal_metrics_for_viewer(qtbot, tmp_path, monkeypatch):
+    app = _make_isolated_app(qtbot, tmp_path, monkeypatch)
+    monkeypatch.setattr(app_module.QMessageBox, "information", lambda *args, **kwargs: None)
+
+    out1 = tmp_path / "san1"
+    out1.write_text("x")
+    now = datetime.now()
+
+    parent = RunEntry(
+        entry_id="p1",
+        name="parent",
+        binary_path=str(tmp_path / "parentbin"),
+        log_path=str(tmp_path / "parentlog"),
+        timestamp=now,
+        sanitized_outputs=[SanitizedBinaryOutput(output_id="o1", output_path=str(out1), works=None, generated_at=now)],
+        run_metrics=None,
+    )
+
+    app.run_entries = [parent]
+    app._refresh_entry_views(None)
+
+    class _DummyWorker:
+        metrics = None
+
+        def deleteLater(self):
+            return None
+
+    app._current_run_worker = _DummyWorker()
+    app._current_run_thread = None
+    app._current_run_dialog = None
+    app._run_stop_requested = True
+    app._run_stop_reason = "user"
+    app._current_run_params = {
+        "binary_path": str(out1),
+        "log_path": str(tmp_path / "sanlog"),
+        "record_entry": True,
+        "run_label": "parent (Sanitized)",
+        "parent_entry_id": parent.entry_id,
+        "sanitized_binary_path": str(out1),
+        "is_sanitized_run": True,
+        "assume_works_started_at": 0.0,
+        "assume_works_started_at_epoch": 0.0,
+        "batch_mode": False,
+    }
+
+    app._handle_run_worker_failure("PIN exited with 143")
+
+    assert len(app.run_entries) == 2
+    stopped_entry = app.run_entries[-1]
+    assert stopped_entry.is_sanitized_run
+    assert isinstance(stopped_entry.run_metrics, dict)
+    assert "wall_time_ms" in stopped_entry.run_metrics
+
+    selections = [(parent, parent.sanitized_outputs[0])]
+    series = app._metrics_series_for_sanitized_selections(selections)
+    labels = [item.label for item in series]
+    assert Path(str(out1)).name in labels
+
+
+@pytest.mark.qt_no_exception_capture
+def test_cleanup_first_still_records_stopped_run_metrics(qtbot, tmp_path, monkeypatch):
+    app = _make_isolated_app(qtbot, tmp_path, monkeypatch)
+
+    out1 = tmp_path / "san1"
+    out1.write_text("x")
+    now = datetime.now()
+
+    parent = RunEntry(
+        entry_id="p1",
+        name="parent",
+        binary_path=str(tmp_path / "parentbin"),
+        log_path=str(tmp_path / "parentlog"),
+        timestamp=now,
+        sanitized_outputs=[SanitizedBinaryOutput(output_id="o1", output_path=str(out1), works=None, generated_at=now)],
+        run_metrics={"wall_time_ms": 123.0},
+    )
+    app.run_entries = [parent]
+    app._refresh_entry_views(None)
+
+    class _DummyWorker:
+        metrics = None
+
+        def deleteLater(self):
+            return None
+
+    app._current_run_worker = _DummyWorker()
+    app._current_run_thread = None
+    app._current_run_dialog = None
+    app._current_run_params = {
+        "binary_path": str(out1),
+        "log_path": str(tmp_path / "sanlog"),
+        "record_entry": True,
+        "run_label": "parent (Sanitized)",
+        "parent_entry_id": parent.entry_id,
+        "sanitized_binary_path": str(out1),
+        "is_sanitized_run": True,
+        "stop_requested": True,
+        "stop_reason": "user",
+        "assume_works_started_at": 0.0,
+        "assume_works_started_at_epoch": 0.0,
+        "batch_mode": False,
+    }
+    app._run_stop_requested = True
+    app._run_stop_reason = "user"
+
+    # Simulate thread.finished triggering cleanup before the failed() handler.
+    app._cleanup_run_worker()
+
+    assert len(app.run_entries) == 2
+    stopped_entry = app.run_entries[-1]
+    assert stopped_entry.is_sanitized_run
+    assert isinstance(stopped_entry.run_metrics, dict)
+    assert "wall_time_ms" in stopped_entry.run_metrics
+
+    selections = [(parent, parent.sanitized_outputs[0])]
+    series = app._metrics_series_for_sanitized_selections(selections)
+    labels = [item.label for item in series]
+    assert Path(str(out1)).name in labels
