@@ -11,7 +11,7 @@
     "nginx",
     "sshd"
   ],
-  "active_project": "find-honeypot",
+  "active_project": "pwd_san",
   "revng_docker_image": "revng/revng",
   "project_settings": {
     "Default Project": {
@@ -149,49 +149,30 @@
       "sanitize_protect_unwind": true,
       "sanitize_protect_indirect": true,
       "sanitize_segment_padding": "0x2000",
-      "sanitize_segment_gap": "0x0",
+      "sanitize_segment_gap": "0x200000",
       "sanitize_icf_window": "0x400",
       "sanitize_jumptable_window": "0x800",
-      "sanitize_segment_gap_start": "0x0",
-      "sanitize_segment_gap_end": "0x2000",
-      "sanitize_segment_gap_interval": "0x100",
-      "sanitize_segment_gap_history": [
-        "0x2000",
-        "0x0",
-        "0x4000"
-      ],
-      "sanitize_segment_gap_interval_history": [
-        "0x100",
-        "0x0"
-      ],
+      "sanitize_segment_gap_start": "0x200000",
+      "sanitize_segment_gap_end": "0x200000",
+      "sanitize_segment_gap_interval": "0x0",
+      "sanitize_segment_gap_history": [],
+      "sanitize_segment_gap_interval_history": [],
       "sanitize_segment_padding_start": "0x2000",
       "sanitize_segment_padding_end": "0x2000",
       "sanitize_segment_padding_interval": "0x0",
-      "sanitize_segment_padding_history": [
-        "0x2000"
-      ],
-      "sanitize_segment_padding_interval_history": [
-        "0x0"
-      ],
+      "sanitize_segment_padding_history": [],
+      "sanitize_segment_padding_interval_history": [],
       "sanitize_icf_window_start": "0x400",
       "sanitize_icf_window_end": "0x400",
       "sanitize_icf_window_interval": "0x0",
-      "sanitize_icf_window_history": [
-        "0x400"
-      ],
-      "sanitize_icf_window_interval_history": [
-        "0x0"
-      ],
+      "sanitize_icf_window_history": [],
+      "sanitize_icf_window_interval_history": [],
       "sanitize_jumptable_window_start": "0x800",
       "sanitize_jumptable_window_end": "0x800",
       "sanitize_jumptable_window_interval": "0x0",
-      "sanitize_jumptable_window_history": [
-        "0x800"
-      ],
-      "sanitize_jumptable_window_interval_history": [
-        "0x0"
-      ],
-      "sanitize_keep_only_one_per_nop_count": true
+      "sanitize_jumptable_window_history": [],
+      "sanitize_jumptable_window_interval_history": [],
+      "sanitize_keep_only_one_per_nop_count": false
     },
     "nginx": {
       "pin_root": "/home/researchdev/Downloads/pin4",

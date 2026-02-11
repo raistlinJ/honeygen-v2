@@ -101,7 +101,7 @@ class PinRunner:
             raise FileNotFoundError(f"Target binary '{binary}' was not found")
 
         pin_exe = self._ensure_pin_executable()
-        tool = self._ensure_tool_exists()
+        tool = self._ensure_tool_exists(use_sudo=use_sudo, sudo_password=sudo_password)
         log_file = Path(log_path or self.default_log)
         log_file.parent.mkdir(parents=True, exist_ok=True)
         instruction_trace = self.project_root / self._tool_trace_name
@@ -782,19 +782,31 @@ class PinRunner:
             raise FileNotFoundError(f"'{self.pin_bin}' is not a file")
         return self.pin_bin
 
-    def _ensure_tool_exists(self) -> Path:
+    def _ensure_tool_exists(self, *, use_sudo: bool = False, sudo_password: str | None = None) -> Path:
         if not self.tool_path.exists():
-            self._build_pin_tool()
+            self._build_pin_tool(use_sudo=use_sudo, sudo_password=sudo_password)
             if not self.tool_path.exists():
                 raise FileNotFoundError(
                     "PIN tool build failed. Check scripts/build_tool.sh output for details."
                 )
         return self.tool_path
 
-    def build_tool(self, *, on_output: Callable[[str], None] | None = None) -> None:
-        self._build_pin_tool(on_output=on_output)
+    def build_tool(
+        self,
+        *,
+        on_output: Callable[[str], None] | None = None,
+        use_sudo: bool = False,
+        sudo_password: str | None = None,
+    ) -> None:
+        self._build_pin_tool(on_output=on_output, use_sudo=use_sudo, sudo_password=sudo_password)
 
-    def _build_pin_tool(self, *, on_output: Callable[[str], None] | None = None) -> None:
+    def _build_pin_tool(
+        self,
+        *,
+        on_output: Callable[[str], None] | None = None,
+        use_sudo: bool = False,
+        sudo_password: str | None = None,
+    ) -> None:
         build_script = self.project_root / "scripts" / "build_tool.sh"
         if not build_script.exists():
             raise FileNotFoundError(f"Build script not found at {build_script}")
@@ -802,15 +814,46 @@ class PinRunner:
         env = os.environ.copy()
         env.setdefault("PIN_ROOT", str(self.pin_root))
 
+        command: list[str] = ["bash", str(build_script)]
+        stdin = None
+        if use_sudo:
+            if not sudo_password:
+                raise RuntimeError("Sudo password not provided.")
+            # Preserve PIN_ROOT even if sudo filters environment.
+            command = [
+                "sudo",
+                "-S",
+                "-p",
+                "",
+                "env",
+                f"PIN_ROOT={str(self.pin_root)}",
+                "bash",
+                str(build_script),
+            ]
+            stdin = subprocess.PIPE
+
         process = subprocess.Popen(
-            ["bash", str(build_script)],
+            command,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
             cwd=self.project_root / "scripts",
             env=env,
+            stdin=stdin,
         )
+
+        if use_sudo and process.stdin is not None:
+            try:
+                process.stdin.write(sudo_password + "\n")
+                process.stdin.flush()
+            except BrokenPipeError:
+                pass
+            finally:
+                try:
+                    process.stdin.close()
+                except OSError:
+                    pass
 
         assert process.stdout is not None
         captured: list[str] = []

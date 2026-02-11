@@ -171,7 +171,7 @@ def test_pin_runner_emits_cpu_load_series_even_for_short_run(tmp_path, monkeypat
 
     # Bypass filesystem/tool checks.
     monkeypatch.setattr(runner, "_ensure_pin_executable", lambda: Path("/bin/true"))
-    monkeypatch.setattr(runner, "_ensure_tool_exists", lambda: Path("/bin/true"))
+    monkeypatch.setattr(runner, "_ensure_tool_exists", lambda *args, **kwargs: Path("/bin/true"))
 
     # Fake out process creation.
     import src.services.pin_runner as pin_runner_module
@@ -233,7 +233,7 @@ def test_pin_runner_parses_time_v_metrics_for_sudo_runs(tmp_path, monkeypatch):
 
     # Bypass filesystem/tool checks.
     monkeypatch.setattr(runner, "_ensure_pin_executable", lambda: Path("/bin/true"))
-    monkeypatch.setattr(runner, "_ensure_tool_exists", lambda: Path("/bin/true"))
+    monkeypatch.setattr(runner, "_ensure_tool_exists", lambda *args, **kwargs: Path("/bin/true"))
 
     import src.services.pin_runner as pin_runner_module
 
@@ -275,7 +275,7 @@ def test_pin_runner_sudo_sidecar_emits_time_series_metrics(tmp_path, monkeypatch
     (tmp_path / "scripts" / "sudo_metrics_sidecar.py").write_text("# placeholder\n")
 
     monkeypatch.setattr(runner, "_ensure_pin_executable", lambda: Path("/bin/true"))
-    monkeypatch.setattr(runner, "_ensure_tool_exists", lambda: Path("/bin/true"))
+    monkeypatch.setattr(runner, "_ensure_tool_exists", lambda *args, **kwargs: Path("/bin/true"))
 
     import src.services.pin_runner as pin_runner_module
 
@@ -343,7 +343,7 @@ def test_pin_runner_sudo_sidecar_no_pids_falls_back_to_time_and_synthesizes_cpu_
     (tmp_path / "scripts" / "sudo_metrics_sidecar.py").write_text("# placeholder\n")
 
     monkeypatch.setattr(runner, "_ensure_pin_executable", lambda: Path("/bin/true"))
-    monkeypatch.setattr(runner, "_ensure_tool_exists", lambda: Path("/bin/true"))
+    monkeypatch.setattr(runner, "_ensure_tool_exists", lambda *args, **kwargs: Path("/bin/true"))
 
     import src.services.pin_runner as pin_runner_module
 

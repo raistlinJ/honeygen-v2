@@ -70,5 +70,11 @@ class RunnerController:
     def stop_logging(self) -> None:
         self.pin_runner.stop()
 
-    def build_tool(self, on_output: Callable[[str], None] | None = None) -> None:
-        self.pin_runner.build_tool(on_output=on_output)
+    def build_tool(
+        self,
+        on_output: Callable[[str], None] | None = None,
+        *,
+        use_sudo: bool = False,
+        sudo_password: str | None = None,
+    ) -> None:
+        self.pin_runner.build_tool(on_output=on_output, use_sudo=use_sudo, sudo_password=sudo_password)

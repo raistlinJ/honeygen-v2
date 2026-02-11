@@ -6460,7 +6460,21 @@
       "log_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/find-honeypot/instruction_log_find_2026-01-12_20_37_22_Sanitized.txt",
       "timestamp": "2026-01-12T21:40:36.768808",
       "sanitized_binary_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/find-honeypot/find_2026-01-12_20_37_22/sanitized/find_gap100_pad2000_icf400_jt800_1",
-      "sanitized_outputs": [],
+      "sanitized_outputs": [
+        {
+          "output_id": "43478fa8-9679-4840-95b6-d4e78c7b3425",
+          "output_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/find-honeypot/find_2026-01-12_20_37_22/sanitized/find_gap100_pad2000_icf400_jt800_1",
+          "works": null,
+          "segment_gap": 0,
+          "segment_padding": 0,
+          "icf_window": 0,
+          "jumptable_window": 0,
+          "total_instructions": 0,
+          "preserved_instructions": 0,
+          "nopped_instructions": 0,
+          "generated_at": null
+        }
+      ],
       "parent_entry_id": "00653177-4bad-475b-8978-96ba1679e088",
       "is_sanitized_run": true,
       "prepared_segments": [],
@@ -10097,7 +10111,21 @@
       "log_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/nginx/instruction_log_nginx_2026-01-08_18_03_30_Sanitized.txt",
       "timestamp": "2026-01-12T20:25:59.632493",
       "sanitized_binary_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/nginx/nginx_2026-01-08_18_03_30/sanitized/nginx_gap2000_pad0_icf0_jt0",
-      "sanitized_outputs": [],
+      "sanitized_outputs": [
+        {
+          "output_id": "1aea55d0-f835-4bff-ad24-44962608df9b",
+          "output_path": "/home/researchdev/Documents/honeygen/pyside-pin-instruction-logger/projects/nginx/nginx_2026-01-08_18_03_30/sanitized/nginx_gap2000_pad0_icf0_jt0",
+          "works": null,
+          "segment_gap": 0,
+          "segment_padding": 0,
+          "icf_window": 0,
+          "jumptable_window": 0,
+          "total_instructions": 0,
+          "preserved_instructions": 0,
+          "nopped_instructions": 0,
+          "generated_at": null
+        }
+      ],
       "parent_entry_id": "11c7e2ab-f044-4c65-aeb7-998b9d84ef81",
       "is_sanitized_run": true,
       "prepared_segments": [],

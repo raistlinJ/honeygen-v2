@@ -335,15 +335,20 @@ class RunWorker(QObject):
                         except OSError:
                             pass
                 assert proc.stdout is not None
+                output_lines: list[str] = []
                 for line in proc.stdout:
                     clean = line.rstrip()
                     if clean:
+                        output_lines.append(clean)
                         self.output.emit(clean)
                 proc.wait()
                 self._active_prerun_process = None
                 self._active_prerun_pgid = None
                 if proc.returncode != 0:
-                    raise RuntimeError("Pre-run command failed with non-zero exit status")
+                    details = output_lines[-1] if output_lines else "(no output)"
+                    raise RuntimeError(
+                        f"Pre-run command failed (exit {proc.returncode}): {details}"
+                    )
             result = self.controller.run_binary( 
                 self.binary_path,
                 log_path=self.log_path,
@@ -1733,13 +1738,25 @@ class BuildWorker(QObject):
     succeeded = Signal()
     failed = Signal(str)
 
-    def __init__(self, controller: RunnerController) -> None:
+    def __init__(
+        self,
+        controller: RunnerController,
+        *,
+        use_sudo: bool = False,
+        sudo_password: str | None = None,
+    ) -> None:
         super().__init__()
         self.controller = controller
+        self.use_sudo = bool(use_sudo)
+        self.sudo_password = sudo_password
 
     def run(self) -> None:
         try:
-            self.controller.build_tool(on_output=self.output.emit)
+            self.controller.build_tool(
+                on_output=self.output.emit,
+                use_sudo=self.use_sudo,
+                sudo_password=self.sudo_password,
+            )
             self.succeeded.emit()
         except Exception as exc:  # pragma: no cover - GUI background task
             self.failed.emit(str(exc))
@@ -2300,6 +2317,13 @@ class BuildProgressDialog(QDialog):
         self.status_label.setText(f"Build {state}.")
         if self.close_button:
             self.close_button.setEnabled(True)
+
+    def mark_running(self, label: str | None = None) -> None:
+        self._running = True
+        self.progress_bar.setRange(0, 0)
+        self.status_label.setText(label or "Building PIN tool...")
+        if self.close_button:
+            self.close_button.setEnabled(False)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         if self._running:
@@ -6782,6 +6806,19 @@ class App(QMainWindow):
         )
         return any(marker in lowered for marker in error_markers)
 
+    def _permission_error_requires_sudo(self, message: str) -> bool:
+        lowered = (message or "").lower()
+        markers = (
+            "permission denied",
+            "operation not permitted",
+            "errno 13",
+            "eacces",
+            "eprem",
+            "must be root",
+            "are you root",
+        )
+        return any(marker in lowered for marker in markers)
+
     def _execute_command_with_progress(
         self,
         command: list[str],
@@ -7899,7 +7936,23 @@ class App(QMainWindow):
             return
 
         dialog = BuildProgressDialog(self)
-        worker = BuildWorker(self.controller)
+        dialog.mark_running("Building PIN tool...")
+        self._start_build_worker(dialog, use_sudo=False, sudo_password=None, sudo_retry_attempted=False)
+
+        self.build_tool_button.setEnabled(False)
+        self._append_console("Starting PIN tool build...")
+        dialog.exec()
+        self._cleanup_build_worker()
+
+    def _start_build_worker(
+        self,
+        dialog: BuildProgressDialog,
+        *,
+        use_sudo: bool,
+        sudo_password: str | None,
+        sudo_retry_attempted: bool,
+    ) -> None:
+        worker = BuildWorker(self.controller, use_sudo=use_sudo, sudo_password=sudo_password)
         thread = QThread(self)
         worker.moveToThread(thread)
 
@@ -7909,19 +7962,21 @@ class App(QMainWindow):
         self._current_build_thread = thread
         self._current_build_worker = worker
         self._current_build_dialog = dialog
+        self._current_build_params = {
+            "use_sudo": bool(use_sudo),
+            "sudo_retry_attempted": bool(sudo_retry_attempted),
+        }
 
         worker.succeeded.connect(self._handle_build_worker_success)
         worker.failed.connect(self._handle_build_worker_failure)
-        thread.finished.connect(self._cleanup_build_worker)
+        # Ensure the build thread event loop exits after the worker completes.
+        worker.succeeded.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(self._cleanup_build_thread_worker)
         dialog.finished.connect(self._cleanup_build_worker)
 
         thread.started.connect(worker.run)
-
-        self.build_tool_button.setEnabled(False)
-        self._append_console("Starting PIN tool build...")
         thread.start()
-        dialog.exec()
-        self._cleanup_build_worker()
 
     def run_selected_binary(self) -> None:
         if not self.selected_binary:
@@ -12637,16 +12692,73 @@ class App(QMainWindow):
             dialog.mark_finished(True)
         self._update_tool_path_if_default_exists()
         self._append_console("PIN tool build completed successfully.")
-        self._cleanup_build_worker()
+        self._cleanup_build_thread_worker()
 
     def _handle_build_worker_failure(self, error_message: str) -> None:
         dialog = self._current_build_dialog
+        params = getattr(self, "_current_build_params", None) or {}
+
+        # If the build failed due to missing privileges, prompt for sudo and retry once.
+        try:
+            already_retried = bool(params.get("sudo_retry_attempted", False))
+            is_sudo = bool(params.get("use_sudo", False))
+            if (not already_retried) and (not is_sudo) and self._permission_error_requires_sudo(error_message or ""):
+                password = self._obtain_sudo_password("Enter sudo password to build the PIN tool:")
+                if password:
+                    if dialog:
+                        dialog.append_output("Permission denied. Retrying build with sudo...")
+                        dialog.mark_running("Building PIN tool (sudo)...")
+                    self._cleanup_build_thread_worker()
+                    self._start_build_worker(
+                        dialog or BuildProgressDialog(self),
+                        use_sudo=True,
+                        sudo_password=password,
+                        sudo_retry_attempted=True,
+                    )
+                    return
+
+            # If sudo auth failed, clear cache and re-prompt once.
+            if is_sudo and (not already_retried) and self._password_error_requires_retry(error_message or ""):
+                self._append_console("Sudo authentication failed; clearing cached password.")
+                self._clear_cached_sudo_password()
+                password = self._obtain_sudo_password("Enter sudo password to build the PIN tool:")
+                if password:
+                    if dialog:
+                        dialog.append_output("Sudo authentication failed. Retrying build with a new password...")
+                        dialog.mark_running("Building PIN tool (sudo)...")
+                    self._cleanup_build_thread_worker()
+                    self._start_build_worker(
+                        dialog or BuildProgressDialog(self),
+                        use_sudo=True,
+                        sudo_password=password,
+                        sudo_retry_attempted=True,
+                    )
+                    return
+        except Exception:
+            pass
+
         if dialog:
             dialog.append_output(f"Error: {error_message}")
             dialog.mark_finished(False)
         self._append_console(f"Error building PIN tool: {error_message}")
         QMessageBox.critical(self, "Build failed", error_message)
-        self._cleanup_build_worker()
+        self._cleanup_build_thread_worker()
+
+    def _cleanup_build_thread_worker(self) -> None:
+        thread = self._current_build_thread
+        worker = self._current_build_worker
+        if thread:
+            try:
+                if thread.isRunning():
+                    thread.quit()
+                    thread.wait()
+            except Exception:
+                pass
+            thread.deleteLater()
+        if worker:
+            worker.deleteLater()
+        self._current_build_thread = None
+        self._current_build_worker = None
 
     def _cleanup_build_worker(self) -> None:
         thread = self._current_build_thread
@@ -12654,16 +12766,9 @@ class App(QMainWindow):
         dialog = self._current_build_dialog
         if thread is None and worker is None and dialog is None:
             return
-        if thread:
-            if thread.isRunning():
-                thread.quit()
-                thread.wait()
-            thread.deleteLater()
-        if worker:
-            worker.deleteLater()
-        self._current_build_thread = None
-        self._current_build_worker = None
+        self._cleanup_build_thread_worker()
         self._current_build_dialog = None
+        self._current_build_params = None
         if hasattr(self, "build_tool_button"):
             self.build_tool_button.setEnabled(True)
 
@@ -12696,22 +12801,16 @@ class App(QMainWindow):
         binary_label = Path(binary_path).name or binary_path
         if not self._ensure_aslr_disabled_for_execution(binary_label):
             return
-        sudo_password: str | None = None
-        if run_with_sudo:
-            sudo_password = self._obtain_sudo_password(f"Enter sudo password to run {binary_label}:")
-            if not sudo_password:
-                self._append_console("Run cancelled; sudo password not provided.")
-                return
-        extra_args: list[str] | None = None
-        # Use configured default args from project settings
-        config_args = self._project_config().default_target_args
-        if config_args and config_args.strip():
-            import shlex
-            try:
-                extra_args = shlex.split(config_args)
-            except Exception:
-                extra_args = [config_args]
-        try:
+        def _execute_run(*, use_sudo: bool, sudo_password: str | None) -> None:
+            extra_args: list[str] | None = None
+            # Use configured default args from project settings
+            config_args = self._project_config().default_target_args
+            if config_args and config_args.strip():
+                import shlex
+                try:
+                    extra_args = shlex.split(config_args)
+                except Exception:
+                    extra_args = [config_args]
             # Execute optional pre-run command or script before launching PIN
             if pre_run_command:
                 from pathlib import Path as _Path
@@ -12726,18 +12825,19 @@ class App(QMainWindow):
                         cmd = ["bash", "-lc", pre_run_command]
                 except Exception:
                     cmd = ["bash", "-lc", pre_run_command]
-                if run_with_sudo and sudo_password:
+                if use_sudo and sudo_password:
                     cmd = ["sudo", "-S", "-p", "", *cmd]
                 proc = _subprocess.Popen(
                     cmd,
                     stdout=_subprocess.PIPE,
                     stderr=_subprocess.STDOUT,
-                    stdin=_subprocess.PIPE if (run_with_sudo and sudo_password) else None,
+                    stdin=_subprocess.PIPE if (use_sudo and sudo_password) else None,
                     text=True,
                     bufsize=1,
                     cwd=_os.getcwd(),
                 )
-                if run_with_sudo and sudo_password and proc.stdin is not None:
+                output_lines: list[str] = []
+                if use_sudo and sudo_password and proc.stdin is not None:
                     try:
                         proc.stdin.write(sudo_password + "\n")
                         proc.stdin.flush()
@@ -12752,16 +12852,19 @@ class App(QMainWindow):
                 for line in proc.stdout:
                     clean = line.rstrip()
                     if clean:
+                        output_lines.append(clean)
                         self._append_console(clean)
                 proc.wait()
                 if proc.returncode != 0:
-                    raise RuntimeError("Pre-run command failed with non-zero exit status")
+                    details = output_lines[-1] if output_lines else "(no output)"
+                    raise RuntimeError(f"Pre-run command failed (exit {proc.returncode}): {details}")
+
             result_path = self.controller.run_binary(
                 binary_path,
                 log_path=log_path,
                 module_filters=module_filters,
                 unique_only=unique_only,
-                use_sudo=bool(run_with_sudo),
+                use_sudo=bool(use_sudo),
                 sudo_password=sudo_password,
                 extra_target_args=extra_args,
             )
@@ -12770,11 +12873,29 @@ class App(QMainWindow):
                 str(result_path),
                 run_label=run_label,
                 target_args=extra_args,
-                use_sudo=bool(run_with_sudo),
+                use_sudo=bool(use_sudo),
                 module_filters=module_filters,
                 pre_run_command=pre_run_command,
             )
+
+        sudo_password: str | None = None
+        if run_with_sudo:
+            sudo_password = self._obtain_sudo_password(f"Enter sudo password to run {binary_label}:")
+            if not sudo_password:
+                self._append_console("Run cancelled; sudo password not provided.")
+                return
+        try:
+            _execute_run(use_sudo=bool(run_with_sudo), sudo_password=sudo_password)
         except Exception as exc:
+            # If the run failed due to missing privileges, prompt for sudo and retry once.
+            try:
+                if (not run_with_sudo) and self._permission_error_requires_sudo(str(exc) or ""):
+                    password = self._obtain_sudo_password(f"Enter sudo password to run {binary_label}:")
+                    if password:
+                        _execute_run(use_sudo=True, sudo_password=password)
+                        return
+            except Exception:
+                pass
             # If sudo authentication fails, clear cache and re-prompt once.
             try:
                 if run_with_sudo and self._password_error_requires_retry(str(exc) or ""):
@@ -12782,24 +12903,7 @@ class App(QMainWindow):
                     self._clear_cached_sudo_password()
                     sudo_password = self._obtain_sudo_password(f"Enter sudo password to run {binary_label}:")
                     if sudo_password:
-                        result_path = self.controller.run_binary(
-                            binary_path,
-                            log_path=log_path,
-                            module_filters=module_filters,
-                            unique_only=unique_only,
-                            use_sudo=True,
-                            sudo_password=sudo_password,
-                            extra_target_args=extra_args,
-                        )
-                        self._on_run_success(
-                            binary_path,
-                            str(result_path),
-                            run_label=run_label,
-                            target_args=extra_args,
-                            use_sudo=True,
-                            module_filters=module_filters,
-                            pre_run_command=pre_run_command,
-                        )
+                        _execute_run(use_sudo=True, sudo_password=sudo_password)
                         return
             except Exception:
                 pass
@@ -12900,25 +13004,43 @@ class App(QMainWindow):
                     dest = dest_dir / f"{base_name}.{counter}"
                     counter += 1
 
-                def _copy_with_sudo(src_path: Path, dest_path: Path) -> None:
+                def _copy_with_sudo(src_path: Path, dest_path: Path, *, prompt: str) -> bool:
                     import subprocess as _subprocess
 
-                    if not sudo_password:
-                        raise PermissionError("Destination requires sudo but sudo is disabled for this run.")
-                    cmd = ["sudo", "-S", "-p", "", "cp", "-p", str(src_path), str(dest_path)]
-                    _subprocess.run(
-                        cmd,
-                        input=sudo_password + "\n",
-                        text=True,
-                        stdout=_subprocess.PIPE,
-                        stderr=_subprocess.STDOUT,
-                        check=True,
-                    )
+                    password = sudo_password or self._obtain_sudo_password(prompt)
+                    if not password:
+                        return False
+                    attempts = 0
+                    last_output = ""
+                    while attempts < 2:
+                        attempts += 1
+                        cmd = ["sudo", "-S", "-p", "", "cp", "-p", str(src_path), str(dest_path)]
+                        completed = _subprocess.run(
+                            cmd,
+                            input=password + "\n",
+                            text=True,
+                            stdout=_subprocess.PIPE,
+                            stderr=_subprocess.STDOUT,
+                            check=False,
+                        )
+                        last_output = (completed.stdout or "").strip()
+                        if completed.returncode == 0:
+                            return True
+                        if not self._password_error_requires_retry(last_output):
+                            raise RuntimeError(last_output or "sudo cp failed")
+                        self._append_console("Sudo authentication failed; clearing cached password.")
+                        self._clear_cached_sudo_password()
+                        password = self._obtain_sudo_password(prompt)
+                        if not password:
+                            return False
+                    raise RuntimeError(last_output or "sudo cp failed")
 
                 try:
                     shutil.copy2(src, dest)
                 except PermissionError:
-                    _copy_with_sudo(src, dest)
+                    prompt = "Enter sudo password to copy the sanitized binary into the original directory:"
+                    if not _copy_with_sudo(src, dest, prompt=prompt):
+                        raise PermissionError("Copy cancelled; sudo password not provided.")
 
                 self._append_console(f"Copied sanitized binary to {dest} and will run that copy.")
                 binary_path = str(dest)
@@ -13413,6 +13535,54 @@ class App(QMainWindow):
             is_sudo = bool(params.get("use_sudo", False))
             is_batch = bool(params.get("batch_mode", False))
             already_retried = bool(params.get("sudo_retry_attempted", False))
+
+            # If the run failed due to missing privileges, prompt for sudo and retry once.
+            if (
+                not self._run_stop_requested
+                and (not is_batch)
+                and (not is_sudo)
+                and (not already_retried)
+                and binary_path
+                and self._permission_error_requires_sudo(error_message or "")
+            ):
+                binary_label = Path(str(binary_path)).name or str(binary_path)
+                prompt = f"Enter sudo password to run {binary_label}:"
+                password = self._obtain_sudo_password(prompt)
+                if password:
+                    if dialog:
+                        dialog.append_output("Permission denied. Retrying with sudo...")
+                        dialog.set_running_label(binary_label)
+                    params["sudo_retry_attempted"] = True
+                    self._cleanup_run_worker()
+                    self._run_with_progress(
+                        str(binary_path),
+                        params.get("log_path"),
+                        record_entry=bool(params.get("record_entry", True)),
+                        entry_to_refresh=params.get("entry_to_refresh"),
+                        dialog_label=binary_label,
+                        run_label=params.get("run_label"),
+                        parent_entry_id=params.get("parent_entry_id"),
+                        sanitized_binary_path=params.get("sanitized_binary_path"),
+                        is_sanitized_run=bool(params.get("is_sanitized_run", False)),
+                        module_filters=params.get("module_filters"),
+                        unique_only=bool(params.get("unique_only", False)),
+                        run_with_sudo=True,
+                        metrics_options=params.get("metrics_options"),
+                        pre_run_command=params.get("pre_run_command"),
+                        target_args=params.get("target_args"),
+                        original_binary_path=params.get("original_binary_path"),
+                        copy_binary_to_relative_path=bool(params.get("copy_binary_to_relative_path", False)),
+                        copy_sanitized_to_original_path=bool(params.get("copy_sanitized_to_original_path", False)),
+                        assume_works_entry_id=params.get("assume_works_entry_id"),
+                        assume_works_output_id=params.get("assume_works_output_id"),
+                        assume_works_after_ms=params.get("assume_works_after_ms"),
+                        block=False,
+                        dialog=dialog,
+                        suppress_failure_dialog=bool(params.get("suppress_failure_dialog", False)),
+                        batch_mode=False,
+                    )
+                    return
+
             if (
                 not self._run_stop_requested
                 and is_sudo
